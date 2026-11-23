@@ -2,9 +2,9 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.4.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
-shadow resolution, distance and filtering, draw distance for effects and grass, and texture
-filtering and sharpness. It also carries the probe tools used to map the engine.
+**0.5.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
+shadow resolution, distance and filtering, draw distance for effects and grass, ambient
+occlusion and god rays quality, and texture filtering and sharpness. It also carries the probe tools used to map the engine.
 
 ## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
 
@@ -24,6 +24,12 @@ filtering and sharpness. It also carries the probe tools used to map the engine.
   decides its own); its distance limits are the effects cull distances (sEffect, 8 tiers from
   10 m to 200 m, stored with their squares) and grass fade/LOD distances (sGrass, fade 10-300 m,
   LOD 10-80 m). Both are scaled from the game's values. Applies at once, in gameplay.
+- **Ambient occlusion**: Game, Full resolution, Full resolution + smoother (2x blur taps). The
+  game's uAmbientOcclusionFilter (resolution enum 0 = screen size .. 3 = quarter). Only where a
+  level creates that filter; none existed in Leon chapter 1, so it is untested in game. The
+  overlay shows how many AO and god rays filters are active.
+- **God rays**: Game, Smoother (2x iterations). uGodRaysFilter / uMultiGodRaysFilter; same
+  caveat, untested in game.
 - **Texture filtering**: Game, 16x anisotropic. Surface textures (wrapping samplers with linear
   filtering and mips) only; full-screen passes and shadow maps keep the game's filtering.
 - **Texture sharpness**: Game, -0.5, -1 mip bias on the same samplers. -1 can shimmer.

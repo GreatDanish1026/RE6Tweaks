@@ -822,11 +822,13 @@ volatile LONG g_viewportCalls = 0, g_viewportChanged = 0;
 bool g_loggedChange = false;
 void ApplyShadows();       // shadow options; runs on the game thread from the camera hook
 void ApplyDrawDistance();  // draw distance option; same
+void ApplyFilters();       // ambient occlusion / god rays / motion blur quality; same
 
 void __stdcall OnCameraCtrl(uintptr_t unit) {
     InterlockedIncrement(&g_viewportCalls);
     ApplyShadows();
     ApplyDrawDistance();
+    ApplyFilters();
     const float fs = g_fovScale, ds = g_distScale;
     if (fs == 1.0f && ds == 1.0f) return;
     float* fov = reinterpret_cast<float*>(unit + 0x4C);
@@ -904,11 +906,23 @@ void InstallCameraHook() {
 struct ShadowClass {
     uint32_t vt;
     const char* name;
+    int maxEntries = 64;  // vtable length cap (the walk stops earlier at non-code values)
 };
 const ShadowClass kShadowClasses[] = {
     {0x016ea768, "uLightSpaceShadow"}, {0x016ea800, "uStableShadow"},
     {0x016ea888, "uUniformShadow"},    {0x016ea910, "uSpotShadow"},
 };
+// Every class whose live units are tracked through vtable hooks: the shadows, and the
+// post-processing filters with quality settings (see "filter quality" below).
+const ShadowClass kTrackedClasses[] = {
+    {0x016ea768, "uLightSpaceShadow"},       {0x016ea800, "uStableShadow"},
+    {0x016ea888, "uUniformShadow"},          {0x016ea910, "uSpotShadow"},
+    // Filters: 18 entries (the base filter vtable; uMultiGodRaysFilter's walk otherwise runs on
+    // into the following data).
+    {0x016e8390, "uAmbientOcclusionFilter", 18}, {0x016e8640, "uGodRaysFilter", 18},
+    {0x016fa0e0, "uMultiGodRaysFilter", 18},     {0x016e7640, "uMotionBlurFilter", 18},
+};
+constexpr int kTrackedCount = static_cast<int>(sizeof(kTrackedClasses) / sizeof(kTrackedClasses[0]));
 using SetU32Fn = void(__thiscall*)(void*, uint32_t);
 const SetU32Fn kSetMapSize = reinterpret_cast<SetU32Fn>(0x1039680);
 const SetU32Fn kSetPcfType = reinterpret_cast<SetU32Fn>(0x1028c50);  // mPCFType (+0xEC), plain store
@@ -938,7 +952,22 @@ std::map<uintptr_t, ShadowUnit> g_shadowUnits;  // game thread only
 std::string g_shadowStatus = "shadows: none seen yet (gameplay only)";
 std::string g_shadowHookStatus = "shadow hooks: not installed";
 
+bool IsTrackedVt(uint32_t vt) {
+    for (const auto& c : kTrackedClasses)
+        if (c.vt == vt) return true;
+    return false;
+}
+
 void __stdcall RecordUnit(uintptr_t obj) {
+    // Only units of the tracked classes (a vtable walk that ran into a neighbouring class's
+    // entries must not fill the set with other objects). Called by the engine on a live object.
+    uint32_t vt = 0;
+    __try {
+        vt = *reinterpret_cast<const uint32_t*>(obj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    if (!IsTrackedVt(vt)) return;
     AcquireSRWLockShared(&g_liveLock);
     const bool known = g_live.count(obj) != 0;
     ReleaseSRWLockShared(&g_liveLock);
@@ -975,22 +1004,24 @@ uint8_t* MakeStub(uint8_t*& mem, void* fn, const uint32_t* orig) {
 
 void InstallShadowHooks() {
     // Original entries are kept here (the stubs jump through them).
-    static uint32_t originals[4][64];
-    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4 * 64 * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    static uint32_t originals[kTrackedCount][64];
+    auto* mem = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, kTrackedCount * 64 * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!mem) return;
     int hooked = 0;
-    for (int c = 0; c < 4; ++c) {
-        auto* vt = reinterpret_cast<uint32_t*>(kShadowClasses[c].vt);
+    for (int c = 0; c < kTrackedCount; ++c) {
+        auto* vt = reinterpret_cast<uint32_t*>(kTrackedClasses[c].vt);
         int n = 0;
-        // Entries until a non-code value or the start of another shadow class's vtable.
+        // Entries until a non-code value or the start of another tracked class's vtable.
         auto otherVtable = [&](uintptr_t a) {
-            for (const auto& o : kShadowClasses)
-                if (o.vt != kShadowClasses[c].vt && o.vt == a) return true;
+            for (const auto& o : kTrackedClasses)
+                if (o.vt != kTrackedClasses[c].vt && o.vt == a) return true;
             return false;
         };
-        while (n < 64 && g_text.In(vt[n]) && !otherVtable(reinterpret_cast<uintptr_t>(vt + n))) ++n;
+        const int cap = std::min(64, kTrackedClasses[c].maxEntries);
+        while (n < cap && g_text.In(vt[n]) && !otherVtable(reinterpret_cast<uintptr_t>(vt + n))) ++n;
         if (n < 8) {
-            Log("shadow hooks: %s vtable looks wrong (%d entries)", kShadowClasses[c].name, n);
+            Log("unit hooks: %s vtable looks wrong (%d entries)", kTrackedClasses[c].name, n);
             continue;
         }
         DWORD old;
@@ -1004,7 +1035,7 @@ void InstallShadowHooks() {
             ++hooked;
         }
         VirtualProtect(vt, n * 4, old, &old);
-        Log("shadow hooks: %s, %d vtable entries", kShadowClasses[c].name, n);
+        Log("unit hooks: %s, %d vtable entries", kTrackedClasses[c].name, n);
     }
     FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
     g_shadowHookStatus = hooked ? "shadow hooks: active" : "shadow hooks: failed";
@@ -1159,6 +1190,136 @@ void ApplyShadows() {
     char buf[96];
     snprintf(buf, sizeof(buf), "shadows: %d live shadow units", active);
     g_shadowStatus = buf;
+}
+
+// ---------------------------------------------------------------- filter quality
+//
+// Post-processing filters are units too, tracked like the shadows (vtable hooks). Fields from
+// their property lists:
+//   uAmbientOcclusionFilter (vt 0x16e8390): mResolution +0x2B8 (setter 0xF885C0 rebuilds the
+//     AO targets; 0 = screen size, 1 = half, 2 = half/mixed, 3 = quarter, 4 = ...),
+//     mBlurTapNum +0x2C0;
+//   uGodRaysFilter (vt 0x16e8640) and uMultiGodRaysFilter (0x16fa0e0): mIterativeNum, byte +0x81
+//     (its setter is a plain store);
+//   uMotionBlurFilter (vt 0x16e7640): mResolution +0x7C, mVelocityResolution +0x84 (0..3).
+//     Logged only: in game both are already 0 (full resolution), so there is no option for it.
+// In the first test area (Leon, chapter 1) no AO or god rays filter existed at all; the
+// options only act where a level creates them (the overlay counts them).
+// Applied on the game thread from the camera hook; the game's values come back with Game.
+
+const Choice kAoChoices[] = {{"Game", 0.0f}, {"Full resolution", 1.0f}, {"Full resolution, smoother", 2.0f}};
+const Choice kGodRayChoices[] = {{"Game", 0.0f}, {"Smoother (2x iterations)", 1.0f}};
+int g_aoChoice = 0, g_godRayChoice = 0;
+constexpr int g_motionBlurChoice = 0;  // no option: the game already uses full resolution
+const SetU32Fn kSetAoResolution = reinterpret_cast<SetU32Fn>(0xF885C0);
+
+struct FilterUnit {
+    uint32_t vt = 0;
+    bool logged = false;
+    uint32_t a0 = 0, a1 = 0;      // game values (meaning per class)
+    uint32_t w0 = ~0u, w1 = ~0u;  // values written by us (~0 = none)
+};
+std::map<uintptr_t, FilterUnit> g_filterUnits;  // game thread only
+std::string g_filterStatus = "filters: none seen yet (gameplay only)";
+
+bool ReadU32(uintptr_t a, uint32_t& v) { return CopyGuarded(a, &v, 4); }
+bool WriteU32(uintptr_t a, uint32_t v) {
+    __try {
+        *reinterpret_cast<uint32_t*>(a) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool WriteU8(uintptr_t a, uint8_t v) {
+    __try {
+        *reinterpret_cast<uint8_t*>(a) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// One field: the game's value is tracked in `orig` (anything that isn't what we wrote);
+// want(orig) is written while the option is on, and the game's value put back when it's off.
+template <typename Set, typename Want>
+void ApplyField(uint32_t cur, uint32_t& orig, uint32_t& written, bool on, Set set, Want want) {
+    if (written == ~0u || cur != written) orig = cur;
+    if (!on) {
+        if (written != ~0u && cur == written) set(orig);
+        written = ~0u;
+        return;
+    }
+    const uint32_t w = want(orig);
+    if (cur != w) set(w);
+    written = w;
+}
+
+void ApplyFilters() {
+    std::vector<uintptr_t> live;
+    AcquireSRWLockShared(&g_liveLock);
+    live.assign(g_live.begin(), g_live.end());
+    ReleaseSRWLockShared(&g_liveLock);
+    for (auto it = g_filterUnits.begin(); it != g_filterUnits.end();)
+        it = std::binary_search(live.begin(), live.end(), it->first) ? std::next(it) : g_filterUnits.erase(it);
+    int ao = 0, rays = 0, blur = 0;
+    for (uintptr_t obj : live) {
+        uint32_t vt = 0;
+        if (!ReadU32(obj, vt)) continue;
+        if (vt != 0x016e8390 && vt != 0x016e8640 && vt != 0x016fa0e0 && vt != 0x016e7640) continue;
+        FilterUnit& u = g_filterUnits[obj];
+        if (u.vt != vt) u = FilterUnit{vt};
+        if (vt == 0x016e8390) {  // ambient occlusion
+            uint32_t res = 0, taps = 0, bounce = 0;
+            if (!ReadU32(obj + 0x2B8, res) || !ReadU32(obj + 0x2C0, taps) || !ReadU32(obj + 0x2AC, bounce) || res > 4 ||
+                taps > 256)
+                continue;
+            if (!u.logged) {
+                u.logged = true;
+                Log("filter %08x uAmbientOcclusionFilter: resolution %u, blur taps %u, indirect bounce %u", (unsigned)obj,
+                    res, taps, bounce & 0xFF);
+            }
+            ++ao;
+            ApplyField(res, u.a0, u.w0, g_aoChoice >= 1, [&](uint32_t v) { CallSetU32(kSetAoResolution, obj, v); },
+                       [](uint32_t) { return 0u; });
+            ApplyField(taps, u.a1, u.w1, g_aoChoice >= 2, [&](uint32_t v) { WriteU32(obj + 0x2C0, v); },
+                       [](uint32_t o) { return std::min(std::max(o * 2, 4u), 32u); });
+        } else if (vt == 0x016e8640 || vt == 0x016fa0e0) {  // god rays
+            uint8_t iter = 0;
+            if (!CopyGuarded(obj + 0x81, &iter, 1)) continue;
+            if (!u.logged) {
+                u.logged = true;
+                uint32_t bits = 0;
+                ReadU32(obj + 0x80, bits);
+                Log("filter %08x %s: iterations %u, quality %u, mode %u", (unsigned)obj,
+                    vt == 0x016e8640 ? "uGodRaysFilter" : "uMultiGodRaysFilter", iter, (bits >> 4) & 15, bits & 15);
+            }
+            ++rays;
+            ApplyField(iter, u.a0, u.w0, g_godRayChoice >= 1,
+                       [&](uint32_t v) { WriteU8(obj + 0x81, static_cast<uint8_t>(v)); },
+                       [](uint32_t o) { return std::min(std::max(o * 2, 2u), 64u); });
+        } else {  // motion blur
+            uint32_t res = 0, vres = 0, samples = 0;
+            if (!ReadU32(obj + 0x7C, res) || !ReadU32(obj + 0x84, vres) || !ReadU32(obj + 0x78, samples) || res > 3 ||
+                vres > 3)
+                continue;
+            if (!u.logged) {
+                u.logged = true;
+                Log("filter %08x uMotionBlurFilter: resolution %u, velocity resolution %u, sample level %u",
+                    (unsigned)obj, res, vres, samples);
+            }
+            ++blur;
+            ApplyField(res, u.a0, u.w0, g_motionBlurChoice >= 1, [&](uint32_t v) { WriteU32(obj + 0x7C, v); },
+                       [](uint32_t) { return 0u; });
+            ApplyField(vres, u.a1, u.w1, g_motionBlurChoice >= 1, [&](uint32_t v) { WriteU32(obj + 0x84, v); },
+                       [](uint32_t) { return 0u; });
+        }
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "active here: %d ambient occlusion filter(s), %d god rays filter(s)%s", ao, rays,
+             ao + rays ? "" : " (this area has neither)");
+    (void)blur;
+    g_filterStatus = buf;
 }
 
 // ---------------------------------------------------------------- draw distance
@@ -1364,6 +1525,13 @@ void LoadCameraSettings() {
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowDistance", v) && v >= 0 &&
         v < (int)std::size(kShadowDistChoices))
         g_shadowDistChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "AmbientOcclusion", v) && v >= 0 &&
+        v < (int)std::size(kAoChoices))
+        g_aoChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "GodRays", v) && v >= 0 && v < (int)std::size(kGodRayChoices))
+        g_godRayChoice = v;
+    Log("settings: ambient occlusion %s, god rays %s", kAoChoices[g_aoChoice].label,
+        kGodRayChoices[g_godRayChoice].label);
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "DrawDistance", v) && v >= 0 &&
         v < (int)std::size(kDrawChoices))
         g_drawChoice = v;
@@ -1397,6 +1565,8 @@ void SaveCameraSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowDistance", g_shadowDistChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowFilter", g_shadowFilterChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "DrawDistance", g_drawChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "AmbientOcclusion", g_aoChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "GodRays", g_godRayChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureFiltering", g_anisoChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureSharpness", g_sharpChoice);
     ApplyCameraChoices();
@@ -1548,6 +1718,15 @@ void DrawOverlay(effect_runtime*) {
           "Effects (particles, smoke, sparks) and grass are drawn further from the camera. RE6 draws "
           "level geometry and characters in full already; these are its distance limits. Applies at "
           "once, in gameplay.");
+    ImGui::Separator();
+    combo("Ambient occlusion", g_aoChoice, kAoChoices, (int)std::size(kAoChoices),
+          "The game's ambient occlusion (soft shadowing in corners and creases) at full screen resolution "
+          "instead of reduced; 'smoother' also doubles its blur samples. Only where a level uses the game's "
+          "AO filter (the line below counts them; 0 = this area has none). Applies at once, in gameplay.");
+    combo("God rays", g_godRayChoice, kGodRayChoices, (int)std::size(kGodRayChoices),
+          "Twice the iterations for light shafts: less banding and stepping. Only where a level has god rays "
+          "(counted below). Applies at once, in gameplay.");
+    ImGui::TextDisabled("%s", g_filterStatus.c_str());
     ImGui::Separator();
     combo("Texture filtering", g_anisoChoice, kAnisoChoices, (int)std::size(kAnisoChoices),
           "16x anisotropic filtering for surface textures: floors and walls stay sharp at an angle. "
