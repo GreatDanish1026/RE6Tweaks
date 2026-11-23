@@ -2,8 +2,8 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.2.0**: startup crash fixes, field of view and camera distance for the gameplay camera, and
-shadow resolution and distance. It also carries the probe tools used to map the engine.
+**0.3.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
+shadow resolution, distance and filtering, and texture filtering and sharpness. It also carries the probe tools used to map the engine.
 
 ## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
 
@@ -17,6 +17,15 @@ shadow resolution and distance. It also carries the probe tools used to map the 
   (sun 512/1024, lamps and flashlight 512/1024). Applies at once, in gameplay.
 - **Shadow distance**: Game, 1.5x, 2x. Shadows drawn further out; with sun shadows it spreads
   the map over a larger area, so pair it with a higher resolution.
+- **Shadow filtering**: Game, Filter 2, Filter 3. The shadow shaders support four edge filters
+  (mPCFType 0-3); the game uses 1.
+- **Texture filtering**: Game, 16x anisotropic. Surface textures (wrapping samplers with linear
+  filtering and mips) only; full-screen passes and shadow maps keep the game's filtering.
+- **Texture sharpness**: Game, -0.5, -1 mip bias on the same samplers. -1 can shimmer.
+
+Textures: RenoDX builds its D3D11 samplers inside its D3D9 proxy, out of reach of ReShade's
+create_sampler event, so RE6Tweaks hooks IDirect3DDevice9::SetSamplerState (vtable slot 69) on
+the device the game gets and changes the filter where the game sets it. All options apply at once.
 
 Shadows: the game's shadow units (uStableShadow, uSpotShadow, uLightSpaceShadow,
 uUniformShadow) are tracked through their own vtables (each entry records the unit, the
