@@ -419,6 +419,8 @@ void SetSlots(void** vt, void* count, void* enumModes, void* createDevice) {
     VirtualProtect(vt + 6, 11 * 4, old, &old);
 }
 
+void HookDeviceSamplers(IDirect3DDevice9* dev);
+
 HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, HWND wnd, DWORD flags,
                                            D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
     const CreateDeviceFn original = g_createDevice;
@@ -441,7 +443,9 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEV
     }
     Log("display-mode fix: removed at CreateDevice (%ux%u)", pp ? pp->BackBufferWidth : 0,
         pp ? pp->BackBufferHeight : 0);
-    return original(d3d, adapter, type, wnd, flags, pp, out);
+    const HRESULT hr = original(d3d, adapter, type, wnd, flags, pp, out);
+    if (SUCCEEDED(hr) && out) HookDeviceSamplers(*out);
+    return hr;
 }
 
 IDirect3D9* WINAPI HookCreate(UINT sdk) {
@@ -905,6 +909,11 @@ const ShadowClass kShadowClasses[] = {
 };
 using SetU32Fn = void(__thiscall*)(void*, uint32_t);
 const SetU32Fn kSetMapSize = reinterpret_cast<SetU32Fn>(0x1039680);
+const SetU32Fn kSetPcfType = reinterpret_cast<SetU32Fn>(0x1028c50);  // mPCFType (+0xEC), plain store
+// The shadow shaders switch on mPCFType: 0, 1 (the game's choice), 2, and 3 or more.
+const Choice kShadowFilterChoices[] = {{"Game", 0.0f}, {"Filter 2", 2.0f}, {"Filter 3", 3.0f}};
+int g_shadowFilterChoice = 0;
+volatile int g_shadowFilter = 0;  // 0 = game
 
 const Choice kShadowResChoices[] = {{"Game", 1.0f}, {"2x", 2.0f}, {"4x", 4.0f}};
 const Choice kShadowDistChoices[] = {{"Game", 1.0f}, {"1.5x", 1.5f}, {"2x", 2.0f}};
@@ -917,6 +926,7 @@ struct ShadowUnit {
     uint32_t origSize = 0, appliedSize = 0;
     float origDist = 0, appliedDist = 0;
     bool logged = false;
+    uint32_t origPcf = 0, appliedPcf = 0;
     int resets = 0;  // times the game put its own map size back after we set ours
     bool gaveUp = false;
 };
@@ -1040,6 +1050,15 @@ bool CallSetMapSize(uintptr_t obj, uint32_t size) {
     }
 }
 
+bool CallSetU32(SetU32Fn fn, uintptr_t obj, uint32_t v) {
+    __try {
+        fn(reinterpret_cast<void*>(obj), v);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool WriteFloat(uintptr_t a, float v) {
     __try {
         *reinterpret_cast<float*>(a) = v;
@@ -1105,6 +1124,16 @@ void ApplyShadows() {
             if (v.dist != want && WriteFloat(obj + 0x58, want)) ++distSets;
             u.appliedDist = want;
         }
+        // Shadow filter (plain field; the game's own setter).
+        const int pf = g_shadowFilter;
+        if (!u.appliedPcf || v.pcf != u.appliedPcf) u.origPcf = v.pcf;
+        if (pf == 0) {
+            if (u.appliedPcf && v.pcf == u.appliedPcf) CallSetU32(kSetPcfType, obj, u.origPcf);
+            u.appliedPcf = 0;
+        } else if (u.origPcf != 0) {  // 0 = filtering off for this light; leave it
+            if (v.pcf != static_cast<uint32_t>(pf)) CallSetU32(kSetPcfType, obj, pf);
+            u.appliedPcf = pf;
+        }
     }
     // Summary every 10 s while something was set (the game recomputes some view distances
     // every frame, so distance writes repeat; they are cheap).
@@ -1121,11 +1150,110 @@ void ApplyShadows() {
     g_shadowStatus = buf;
 }
 
+// ---------------------------------------------------------------- texture options
+//
+// The game sets D3D9 sampler states per draw (IDirect3DDevice9::SetSamplerState, vtable slot
+// 69). RenoDX turns them into D3D11 samplers inside its device proxy, without ReShade's
+// create_sampler event, so the filter is changed where the game sets it: for a sampler that
+// wraps or mirrors (surface textures) with linear minification and mips, the filter becomes
+// 16x anisotropic and the chosen mip bias is added. Clamped samplers (full-screen passes,
+// shadow maps, which need linear filtering for hardware shadow comparison) are left as the
+// game set them. The game sets its sampler states every draw, so changes apply at once.
+
+const Choice kAnisoChoices[] = {{"Game", 0.0f}, {"16x anisotropic", 16.0f}};
+const Choice kSharpChoices[] = {{"Game", 0.0f}, {"Sharper (-0.5)", -0.5f}, {"Sharpest (-1)", -1.0f}};
+int g_anisoChoice = 0, g_sharpChoice = 0;
+volatile LONG g_samplersSeen = 0, g_samplersChanged = 0;
+
+using SetSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+SetSamplerStateFn g_setSamplerState = nullptr;
+
+struct SamplerRequest {  // what the game asked for (D3D9 defaults)
+    DWORD minf = D3DTEXF_POINT, magf = D3DTEXF_POINT, mipf = D3DTEXF_NONE, addrU = D3DTADDRESS_WRAP;
+    DWORD aniso = 1, bias = 0;
+    bool upgraded = false;
+};
+SamplerRequest g_samplers[16];
+
+enum : unsigned { kPushMin = 1, kPushMag = 2, kPushAniso = 4, kPushBias = 8, kPushAll = 15 };
+
+void PushSampler(IDirect3DDevice9* dev, DWORD s, unsigned what) {
+    SamplerRequest& r = g_samplers[s];
+    const float aniso = kAnisoChoices[g_anisoChoice].value, extra = kSharpChoices[g_sharpChoice].value;
+    const bool surface = (r.addrU == D3DTADDRESS_WRAP || r.addrU == D3DTADDRESS_MIRROR) &&
+                         (r.minf == D3DTEXF_LINEAR || r.minf == D3DTEXF_ANISOTROPIC) && r.mipf != D3DTEXF_NONE;
+    const bool up = surface && (aniso > 0.0f || extra != 0.0f);
+    if (up != r.upgraded) {
+        what = kPushAll;  // the sampler changed between upgraded and the game's own state
+        if (up) InterlockedIncrement(&g_samplersChanged);
+    }
+    r.upgraded = up;
+    const bool af = up && aniso > 0.0f;
+    if (what & kPushMin) g_setSamplerState(dev, s, D3DSAMP_MINFILTER, af ? D3DTEXF_ANISOTROPIC : r.minf);
+    if (what & kPushMag)
+        g_setSamplerState(dev, s, D3DSAMP_MAGFILTER, af && r.magf == D3DTEXF_LINEAR ? D3DTEXF_ANISOTROPIC : r.magf);
+    if (what & kPushAniso) g_setSamplerState(dev, s, D3DSAMP_MAXANISOTROPY, af ? static_cast<DWORD>(aniso) : r.aniso);
+    if (what & kPushBias) {
+        float bias;
+        memcpy(&bias, &r.bias, 4);
+        if (up) bias += extra;
+        DWORD bits;
+        memcpy(&bits, &bias, 4);
+        g_setSamplerState(dev, s, D3DSAMP_MIPMAPLODBIAS, bits);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookSetSamplerState(IDirect3DDevice9* dev, DWORD s, D3DSAMPLERSTATETYPE type, DWORD v) {
+    InterlockedIncrement(&g_samplersSeen);
+    if (s >= 16) return g_setSamplerState(dev, s, type, v);  // displacement / vertex samplers
+    SamplerRequest& r = g_samplers[s];
+    switch (type) {
+    case D3DSAMP_MINFILTER: r.minf = v; break;
+    case D3DSAMP_MAGFILTER: r.magf = v; break;
+    case D3DSAMP_MIPFILTER: r.mipf = v; break;
+    case D3DSAMP_ADDRESSU: r.addrU = v; break;
+    case D3DSAMP_MAXANISOTROPY: r.aniso = v; break;
+    case D3DSAMP_MIPMAPLODBIAS: r.bias = v; break;
+    default: return g_setSamplerState(dev, s, type, v);
+    }
+    const bool wanted = kAnisoChoices[g_anisoChoice].value > 0.0f || kSharpChoices[g_sharpChoice].value != 0.0f;
+    if (!wanted && !r.upgraded) return g_setSamplerState(dev, s, type, v);  // all Game: pass through
+    HRESULT hr = D3D_OK;
+    unsigned what = 0;
+    switch (type) {
+    case D3DSAMP_MINFILTER: what = kPushMin; break;
+    case D3DSAMP_MAGFILTER: what = kPushMag; break;
+    case D3DSAMP_MAXANISOTROPY: what = kPushAniso; break;
+    case D3DSAMP_MIPMAPLODBIAS: what = kPushBias; break;
+    default:  // MIPFILTER / ADDRESSU: set it, then re-evaluate (PushSampler pushes all if it flips)
+        hr = g_setSamplerState(dev, s, type, v);
+        break;
+    }
+    PushSampler(dev, s, what);
+    return hr;
+}
+
+std::string g_textureStatus = "texture options: not installed";
+
+void HookDeviceSamplers(IDirect3DDevice9* dev) {
+    if (!dev) return;
+    void** vt = *reinterpret_cast<void***>(dev);
+    if (vt[69] == reinterpret_cast<void*>(&HookSetSamplerState)) return;
+    DWORD old;
+    if (!VirtualProtect(vt + 69, 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    g_setSamplerState = reinterpret_cast<SetSamplerStateFn>(vt[69]);
+    vt[69] = reinterpret_cast<void*>(&HookSetSamplerState);
+    VirtualProtect(vt + 69, 4, old, &old);
+    g_textureStatus = "texture options: active";
+    Log("texture options: hooked SetSamplerState on device %p (vtable %p)", dev, vt);
+}
+
 void ApplyCameraChoices() {
     g_fovScale = kFovChoices[g_fovChoice].value;
     g_distScale = kDistChoices[g_distChoice].value;
     g_shadowResScale = kShadowResChoices[g_shadowResChoice].value;
     g_shadowDistScale = kShadowDistChoices[g_shadowDistChoice].value;
+    g_shadowFilter = static_cast<int>(kShadowFilterChoices[g_shadowFilterChoice].value);
 }
 
 void LoadCameraSettings() {
@@ -1136,8 +1264,19 @@ void LoadCameraSettings() {
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowDistance", v) && v >= 0 &&
         v < (int)std::size(kShadowDistChoices))
         g_shadowDistChoice = v;
-    Log("settings: shadow resolution %s, shadow distance %s", kShadowResChoices[g_shadowResChoice].label,
-        kShadowDistChoices[g_shadowDistChoice].label);
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowFilter", v) && v >= 0 &&
+        v < (int)std::size(kShadowFilterChoices))
+        g_shadowFilterChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "TextureFiltering", v) && v >= 0 &&
+        v < (int)std::size(kAnisoChoices))
+        g_anisoChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "TextureSharpness", v) && v >= 0 &&
+        v < (int)std::size(kSharpChoices))
+        g_sharpChoice = v;
+    Log("settings: shadow resolution %s, shadow distance %s, shadow filter %s, texture filtering %s, sharpness %s",
+        kShadowResChoices[g_shadowResChoice].label, kShadowDistChoices[g_shadowDistChoice].label,
+        kShadowFilterChoices[g_shadowFilterChoice].label, kAnisoChoices[g_anisoChoice].label,
+        kSharpChoices[g_sharpChoice].label);
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "FieldOfView", v) && v >= 0 && v < (int)std::size(kFovChoices))
         g_fovChoice = v;
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "CameraDistance", v) && v >= 0 && v < (int)std::size(kDistChoices))
@@ -1152,6 +1291,9 @@ void SaveCameraSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "CameraDistance", g_distChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowResolution", g_shadowResChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowDistance", g_shadowDistChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowFilter", g_shadowFilterChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "TextureFiltering", g_anisoChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "TextureSharpness", g_sharpChoice);
     ApplyCameraChoices();
 }
 
@@ -1210,6 +1352,15 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
     if (!g_autoScanned && now.QuadPart - g_firstPresent.QuadPart > 20 * g_freq.QuadPart) {
         g_autoScanned = true;
         Scan();
+    }
+    {  // sampler counts in the log, at most every 10 s when they change
+        static LONG lastSeen = -1;
+        static DWORD lastLog = 0;
+        if (g_samplersChanged != lastSeen && GetTickCount() - lastLog > 10000) {
+            lastSeen = g_samplersChanged;
+            lastLog = GetTickCount();
+            Log("samplers: %ld sampler states set, %ld surface samplers upgraded", g_samplersSeen, g_samplersChanged);
+        }
     }
     if (KeyPressed(VK_F9, g_f9)) Snapshot();
     if (KeyPressed(VK_F8, g_f8)) StartTrace();
@@ -1283,7 +1434,19 @@ void DrawOverlay(effect_runtime*) {
     combo("Shadow distance", g_shadowDistChoice, kShadowDistChoices, (int)std::size(kShadowDistChoices),
           "Shadows drawn further from the camera. With cascaded sun shadows this spreads the map over a "
           "larger area, so pair it with a higher shadow resolution. Applies at once, in gameplay.");
+    combo("Shadow filtering", g_shadowFilterChoice, kShadowFilterChoices, (int)std::size(kShadowFilterChoices),
+          "The shadow edge filter. The game uses filter 1; filters 2 and 3 are other filters its shaders "
+          "support but the game doesn't use. Applies at once, in gameplay.");
     ImGui::TextDisabled("%s; %s", g_shadowHookStatus.c_str(), g_shadowStatus.c_str());
+    ImGui::Separator();
+    combo("Texture filtering", g_anisoChoice, kAnisoChoices, (int)std::size(kAnisoChoices),
+          "16x anisotropic filtering for surface textures: floors and walls stay sharp at an angle. "
+          "Applies at once.");
+    combo("Texture sharpness", g_sharpChoice, kSharpChoices, (int)std::size(kSharpChoices),
+          "Uses more detailed texture mips. Sharper surfaces at a distance; can add shimmer. "
+          "Applies at once.");
+    ImGui::TextDisabled("%s (sampler states set: %ld, surface samplers upgraded: %ld)", g_textureStatus.c_str(),
+                        g_samplersSeen, g_samplersChanged);
     ImGui::Separator();
     if (!ImGui::CollapsingHeader("Probe tools")) return;
     if (ImGui::Button("Take snapshot (Ctrl+F9)")) Snapshot();
