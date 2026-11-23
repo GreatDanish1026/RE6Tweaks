@@ -820,11 +820,13 @@ std::string g_cameraStatus = "camera options: not installed";
 volatile LONG g_viewportCalls = 0, g_viewportChanged = 0;
 
 bool g_loggedChange = false;
-void ApplyShadows();  // shadow options; runs on the game thread from the camera hook
+void ApplyShadows();       // shadow options; runs on the game thread from the camera hook
+void ApplyDrawDistance();  // draw distance option; same
 
 void __stdcall OnCameraCtrl(uintptr_t unit) {
     InterlockedIncrement(&g_viewportCalls);
     ApplyShadows();
+    ApplyDrawDistance();
     const float fs = g_fovScale, ds = g_distScale;
     if (fs == 1.0f && ds == 1.0f) return;
     float* fov = reinterpret_cast<float*>(unit + 0x4C);
@@ -1059,6 +1061,15 @@ bool CallSetU32(SetU32Fn fn, uintptr_t obj, uint32_t v) {
     }
 }
 
+bool CopyGuarded(uintptr_t src, void* dst, size_t n) {  // read without the probe's memory map
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool WriteFloat(uintptr_t a, float v) {
     __try {
         *reinterpret_cast<float*>(a) = v;
@@ -1148,6 +1159,94 @@ void ApplyShadows() {
     char buf[96];
     snprintf(buf, sizeof(buf), "shadows: %d live shadow units", active);
     g_shadowStatus = buf;
+}
+
+// ---------------------------------------------------------------- draw distance
+//
+// RE6 has no single model-LOD distance (uBaseModel's LOD type is a per-class virtual); its
+// distance limits are fields of singletons (from their property lists):
+//   sEffect (instance sBioEffect, static 0x186e430): mCullDist, 8 entries of {distance,
+//     distance squared} at +0x238 (count function 0xB1A030 returns 8); the setter 0xF0C5C0
+//     stores both, so both are scaled here;
+//   sGrass (static 0x1870818): mFadeBeginDistance +0x54, mFadeEndDistance +0x58,
+//     mLODBeginDistance +0xD4, mLODEndDistance +0xD8.
+// (sEnemy's LOD mLength[] fields belong to a property function whose owner isn't certain, and
+// only change enemy update rates, so they are not touched.)
+// Each singleton's class is checked by name before writing. Values are scaled from the game's
+// own (a value that isn't the one written here is taken as the game's new value), so Game
+// restores them. Applied on the game thread, once per gameplay frame.
+
+const Choice kDrawChoices[] = {{"Game", 1.0f}, {"1.5x", 1.5f}, {"2x", 2.0f}, {"3x", 3.0f}};
+int g_drawChoice = 0;
+volatile float g_drawScale = 1.0f;
+
+struct ScaledField {
+    uintptr_t staticPtr;
+    const char* cls;
+    uint32_t off;
+    bool squaredNext;  // the next float holds this value squared
+    float orig = 0, applied = 0;
+};
+ScaledField g_drawFields[] = {
+    {0x186e430, "sBioEffect", 0x238, true}, {0x186e430, "sBioEffect", 0x240, true},
+    {0x186e430, "sBioEffect", 0x248, true}, {0x186e430, "sBioEffect", 0x250, true},
+    {0x186e430, "sBioEffect", 0x258, true}, {0x186e430, "sBioEffect", 0x260, true},
+    {0x186e430, "sBioEffect", 0x268, true}, {0x186e430, "sBioEffect", 0x270, true},
+    {0x1870818, "sGrass", 0x54, false},     {0x1870818, "sGrass", 0x58, false},
+    {0x1870818, "sGrass", 0xD4, false},     {0x1870818, "sGrass", 0xD8, false},
+};
+std::map<uintptr_t, uint32_t> g_singletonVt;  // static -> verified vtable, 0 = wrong class (game thread)
+bool g_drawLogged = false;
+
+uintptr_t VerifiedSingleton(uintptr_t staticPtr, const char* cls) {
+    uint32_t obj = 0, vt = 0;
+    if (!CopyGuarded(staticPtr, &obj, 4) || !obj || !CopyGuarded(obj, &vt, 4)) return 0;
+    auto it = g_singletonVt.find(staticPtr);
+    if (it != g_singletonVt.end()) return it->second && it->second == vt ? obj : 0;
+    // First time: name the class through getDTI (slot 4: mov eax, dti; ret; DTI+4 = name).
+    uint32_t getDti = 0, dti = 0, namePtr = 0;
+    uint8_t code[6];
+    char name[40] = {};
+    if (!CopyGuarded(vt + 16, &getDti, 4) || !CopyGuarded(getDti, code, 6) || code[0] != 0xB8 || code[5] != 0xC3)
+        return 0;
+    memcpy(&dti, code + 1, 4);
+    if (!CopyGuarded(dti + 4, &namePtr, 4) || !CopyGuarded(namePtr, name, sizeof(name) - 1) || strcmp(name, cls)) {
+        Log("draw distance: %08x is not %s (%s); skipped", (unsigned)staticPtr, cls, name);
+        g_singletonVt[staticPtr] = 0;
+        return 0;
+    }
+    g_singletonVt[staticPtr] = vt;
+    return obj;
+}
+
+void ApplyDrawDistance() {
+    const float k = g_drawScale;
+    int written = 0;
+    for (ScaledField& f : g_drawFields) {
+        const uintptr_t obj = VerifiedSingleton(f.staticPtr, f.cls);
+        if (!obj) continue;
+        float v = 0;
+        if (!CopyGuarded(obj + f.off, &v, 4) || !std::isfinite(v) || v <= 0.0f || v > 1e7f) continue;
+        if (f.applied == 0.0f || v != f.applied) f.orig = v;  // the game's value
+        if (k == 1.0f && f.applied == 0.0f) continue;          // Game and never changed: leave it
+        const float want = k == 1.0f ? f.orig : f.orig * k;
+        if (v != want) {
+            WriteFloat(obj + f.off, want);
+            if (f.squaredNext) WriteFloat(obj + f.off + 4, want * want);
+            ++written;
+        }
+        f.applied = k == 1.0f ? 0.0f : want;
+    }
+    if (written && !g_drawLogged) {
+        g_drawLogged = true;
+        std::string s;
+        for (const ScaledField& f : g_drawFields) {
+            char b[48];
+            snprintf(b, sizeof(b), " %s+%x=%.0f", f.cls, (unsigned)f.off, f.orig);
+            s += b;
+        }
+        Log("draw distance x%.1f; game values:%s", k, s.c_str());
+    }
 }
 
 // ---------------------------------------------------------------- texture options
@@ -1254,6 +1353,7 @@ void ApplyCameraChoices() {
     g_shadowResScale = kShadowResChoices[g_shadowResChoice].value;
     g_shadowDistScale = kShadowDistChoices[g_shadowDistChoice].value;
     g_shadowFilter = static_cast<int>(kShadowFilterChoices[g_shadowFilterChoice].value);
+    g_drawScale = kDrawChoices[g_drawChoice].value;
 }
 
 void LoadCameraSettings() {
@@ -1264,6 +1364,10 @@ void LoadCameraSettings() {
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowDistance", v) && v >= 0 &&
         v < (int)std::size(kShadowDistChoices))
         g_shadowDistChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "DrawDistance", v) && v >= 0 &&
+        v < (int)std::size(kDrawChoices))
+        g_drawChoice = v;
+    Log("settings: draw distance %s", kDrawChoices[g_drawChoice].label);
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowFilter", v) && v >= 0 &&
         v < (int)std::size(kShadowFilterChoices))
         g_shadowFilterChoice = v;
@@ -1292,6 +1396,7 @@ void SaveCameraSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowResolution", g_shadowResChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowDistance", g_shadowDistChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowFilter", g_shadowFilterChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "DrawDistance", g_drawChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureFiltering", g_anisoChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureSharpness", g_sharpChoice);
     ApplyCameraChoices();
@@ -1438,6 +1543,11 @@ void DrawOverlay(effect_runtime*) {
           "The shadow edge filter. The game uses filter 1; filters 2 and 3 are other filters its shaders "
           "support but the game doesn't use. Applies at once, in gameplay.");
     ImGui::TextDisabled("%s; %s", g_shadowHookStatus.c_str(), g_shadowStatus.c_str());
+    ImGui::Separator();
+    combo("Draw distance", g_drawChoice, kDrawChoices, (int)std::size(kDrawChoices),
+          "Effects (particles, smoke, sparks) and grass are drawn further from the camera. RE6 draws "
+          "level geometry and characters in full already; these are its distance limits. Applies at "
+          "once, in gameplay.");
     ImGui::Separator();
     combo("Texture filtering", g_anisoChoice, kAnisoChoices, (int)std::size(kAnisoChoices),
           "16x anisotropic filtering for surface textures: floors and walls stay sharp at an angle. "
