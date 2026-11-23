@@ -17,7 +17,9 @@
 // Output goes to <game>\RE6Tweaks.log and <game>\RE6Tweaks-probe\.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winternl.h>
 #include <d3d9.h>
+#include <cwctype>
 
 #include <imgui.h>
 #include <reshade.hpp>
@@ -251,8 +253,9 @@ void Scan() {
         }
         fclose(f);
     }
+    static std::set<std::string> logged;  // each singleton once per session
     for (const Found& x : g_found)
-        if (x.cls.size() > 1 && x.cls[0] == 's' && isupper((unsigned char)x.cls[1]))
+        if (x.cls.size() > 1 && x.cls[0] == 's' && isupper((unsigned char)x.cls[1]) && logged.insert(x.cls).second)
             Log("singleton %-24s static %08x -> %08x (getDTI slot %d, DTI %08x)", x.cls.c_str(),
                 (unsigned)x.where, (unsigned)x.obj, x.slot, (unsigned)x.dti);
 }
@@ -397,23 +400,65 @@ HRESULT STDMETHODCALLTYPE HookEnum(IDirect3D9* d3d, UINT adapter, D3DFORMAT fmt,
     return D3D_OK;
 }
 
+// The game lists the modes before it creates its device. At CreateDevice everything is put back
+// (vtable and import), so add-ons that load during CreateDevice (RenoDX patches the same import
+// and crashed on the hooked vtable) see the original d3d9 state.
+using CreateDeviceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
+                                                   D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+CreateDeviceFn g_createDevice = nullptr;
+void** g_hookedVt = nullptr;
+uintptr_t* g_iatSlot = nullptr;
+
+void SetSlots(void** vt, void* count, void* enumModes, void* createDevice) {
+    DWORD old;
+    if (!VirtualProtect(vt + 6, 11 * 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    vt[6] = count;
+    vt[7] = enumModes;
+    vt[16] = createDevice;
+    VirtualProtect(vt + 6, 11 * 4, old, &old);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, HWND wnd, DWORD flags,
+                                           D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
+    const CreateDeviceFn original = g_createDevice;
+    {
+        std::lock_guard<std::mutex> lock(g_modeLock);
+        if (g_hookedVt) {
+            SetSlots(g_hookedVt, reinterpret_cast<void*>(g_count), reinterpret_cast<void*>(g_enum),
+                     reinterpret_cast<void*>(g_createDevice));
+            g_hookedVt = nullptr;
+        }
+        if (g_iatSlot) {
+            DWORD old;
+            if (VirtualProtect(g_iatSlot, 4, PAGE_READWRITE, &old)) {
+                *g_iatSlot = reinterpret_cast<uintptr_t>(g_create);
+                VirtualProtect(g_iatSlot, 4, old, &old);
+            }
+            g_iatSlot = nullptr;
+        }
+        g_modeStatus = "display-mode fix: applied at startup";
+    }
+    Log("display-mode fix: removed at CreateDevice (%ux%u)", pp ? pp->BackBufferWidth : 0,
+        pp ? pp->BackBufferHeight : 0);
+    return original(d3d, adapter, type, wnd, flags, pp, out);
+}
+
 IDirect3D9* WINAPI HookCreate(UINT sdk) {
     IDirect3D9* d3d = g_create(sdk);
     if (!d3d) return d3d;
+    std::lock_guard<std::mutex> lock(g_modeLock);
     void** vt = *reinterpret_cast<void***>(d3d);
-    // IDirect3D9 vtable: 6 GetAdapterModeCount, 7 EnumAdapterModes.
-    if (vt[6] != reinterpret_cast<void*>(&HookCount)) {
-        DWORD old;
-        if (VirtualProtect(vt + 6, 8, PAGE_EXECUTE_READWRITE, &old)) {
-            g_count = reinterpret_cast<CountFn>(vt[6]);
-            g_enum = reinterpret_cast<EnumFn>(vt[7]);
-            vt[6] = reinterpret_cast<void*>(&HookCount);
-            vt[7] = reinterpret_cast<void*>(&HookEnum);
-            VirtualProtect(vt + 6, 8, old, &old);
-            g_modeFixActive = true;
-            g_modeStatus = "display-mode fix: active";
-            Log("display-mode fix: hooked IDirect3D9 vtable %p", vt);
-        }
+    // IDirect3D9 vtable: 6 GetAdapterModeCount, 7 EnumAdapterModes, 16 CreateDevice.
+    if (!g_hookedVt && !g_modeFixActive) {
+        g_count = reinterpret_cast<CountFn>(vt[6]);
+        g_enum = reinterpret_cast<EnumFn>(vt[7]);
+        g_createDevice = reinterpret_cast<CreateDeviceFn>(vt[16]);
+        SetSlots(vt, reinterpret_cast<void*>(&HookCount), reinterpret_cast<void*>(&HookEnum),
+                 reinterpret_cast<void*>(&HookCreateDevice));
+        g_hookedVt = vt;
+        g_modeFixActive = true;
+        g_modeStatus = "display-mode fix: active";
+        Log("display-mode fix: hooked IDirect3D9 vtable %p", vt);
     }
     return d3d;
 }
@@ -437,12 +482,157 @@ void InstallModeFix() {
             if (!VirtualProtect(&iat->u1.Function, 4, PAGE_READWRITE, &old)) return;
             g_create = reinterpret_cast<CreateFn>(iat->u1.Function);
             iat->u1.Function = reinterpret_cast<uintptr_t>(&HookCreate);
+            g_iatSlot = reinterpret_cast<uintptr_t*>(&iat->u1.Function);
             VirtualProtect(&iat->u1.Function, 4, old, &old);
             Log("display-mode fix: Direct3DCreate9 import redirected");
             return;
         }
     }
     Log("display-mode fix: Direct3DCreate9 import not found");
+}
+
+// ---------------------------------------------------------------- RenoDX alignment shim
+//
+// RenoDX for RE6 (build 6AB159E0) allocates a 0x1840-byte object with HeapAlloc, which only
+// guarantees 8-byte alignment in a 32-bit process, and its constructor clears it with movaps
+// (16-byte alignment required). Whether it crashes depends on the heap layout of that launch
+// (renodx-residentevil6.addon32+0x72a9c). Loading RE6Tweaks early made it crash every time.
+// This redirects that add-on's own HeapAlloc/HeapFree/HeapReAlloc/HeapSize imports so its
+// blocks are 16-byte aligned: a block that comes back misaligned is moved up 8 bytes inside a
+// 16-byte larger allocation and remembered. It's installed as the DLL is mapped (after its
+// imports are bound, before its code runs), via LdrRegisterDllNotification.
+
+constexpr DWORD kRenoDxStamp = 0x6AB159E0;
+struct Shifted {
+    void* real;
+    SIZE_T size;
+};
+std::mutex g_heapLock;
+std::map<uintptr_t, Shifted> g_shifted;
+std::string g_renoStatus = "RenoDX alignment fix: RenoDX not loaded";
+
+LPVOID WINAPI AlignedHeapAlloc(HANDLE heap, DWORD flags, SIZE_T size) {
+    void* p = HeapAlloc(heap, flags, size + 16);
+    if (!p || !(reinterpret_cast<uintptr_t>(p) & 15)) return p;
+    const uintptr_t q = (reinterpret_cast<uintptr_t>(p) + 15) & ~static_cast<uintptr_t>(15);
+    std::lock_guard<std::mutex> lock(g_heapLock);
+    g_shifted[q] = {p, size};
+    return reinterpret_cast<void*>(q);
+}
+
+bool TakeShifted(LPCVOID mem, Shifted& out, bool erase) {
+    std::lock_guard<std::mutex> lock(g_heapLock);
+    auto it = g_shifted.find(reinterpret_cast<uintptr_t>(mem));
+    if (it == g_shifted.end()) return false;
+    out = it->second;
+    if (erase) g_shifted.erase(it);
+    return true;
+}
+
+BOOL WINAPI AlignedHeapFree(HANDLE heap, DWORD flags, LPVOID mem) {
+    Shifted s;
+    return HeapFree(heap, flags, TakeShifted(mem, s, true) ? s.real : mem);
+}
+
+SIZE_T WINAPI AlignedHeapSize(HANDLE heap, DWORD flags, LPCVOID mem) {
+    Shifted s;
+    if (TakeShifted(mem, s, false)) return s.size;
+    const SIZE_T n = HeapSize(heap, flags, mem);
+    return n == static_cast<SIZE_T>(-1) || n < 16 ? n : n - 16;  // unshifted blocks carry 16 spare bytes
+}
+
+LPVOID WINAPI AlignedHeapReAlloc(HANDLE heap, DWORD flags, LPVOID mem, SIZE_T size) {
+    if (!mem) return AlignedHeapAlloc(heap, flags & ~HEAP_REALLOC_IN_PLACE_ONLY, size);
+    Shifted s;
+    const bool shifted = TakeShifted(mem, s, false);
+    if (!shifted) {
+        void* p = HeapReAlloc(heap, flags, mem, size + 16);
+        if (!p || !(reinterpret_cast<uintptr_t>(p) & 15)) return p;
+        if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return p;  // can't move it; same address as before
+        // Landed misaligned: move it into an aligned block.
+        void* q = AlignedHeapAlloc(heap, flags & HEAP_ZERO_MEMORY, size);
+        if (!q) return p;  // mem already moved to p: return it (valid, just misaligned)
+        memcpy(q, p, size);
+        HeapFree(heap, 0, p);
+        return q;
+    }
+    if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return size <= s.size ? mem : nullptr;
+    void* q = AlignedHeapAlloc(heap, flags & HEAP_ZERO_MEMORY, size);
+    if (!q) return nullptr;
+    memcpy(q, mem, std::min(size, s.size));
+    AlignedHeapFree(heap, 0, mem);
+    return q;
+}
+
+void PatchRenoDx(HMODULE mod) {
+    const auto base = reinterpret_cast<uintptr_t>(mod);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != kRenoDxStamp) {
+        g_renoStatus = "RenoDX alignment fix: not needed for this RenoDX build";
+        Log("RenoDX build %08x: alignment shim not applied (made for %08x)",
+            (unsigned)nt->FileHeader.TimeDateStamp, (unsigned)kRenoDxStamp);
+        return;
+    }
+    const struct { const char* name; void* fn; } hooks[] = {
+        {"HeapAlloc", reinterpret_cast<void*>(&AlignedHeapAlloc)},
+        {"HeapFree", reinterpret_cast<void*>(&AlignedHeapFree)},
+        {"HeapReAlloc", reinterpret_cast<void*>(&AlignedHeapReAlloc)},
+        {"HeapSize", reinterpret_cast<void*>(&AlignedHeapSize)},
+    };
+    int patched = 0;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (_stricmp(reinterpret_cast<const char*>(base + imp->Name), "kernel32.dll")) continue;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk);
+        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++iat) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const char* n = reinterpret_cast<const char*>(
+                reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData)->Name);
+            for (const auto& h : hooks)
+                if (!strcmp(n, h.name)) {
+                    DWORD old;
+                    if (VirtualProtect(&iat->u1.Function, 4, PAGE_READWRITE, &old)) {
+                        iat->u1.Function = reinterpret_cast<uintptr_t>(h.fn);
+                        VirtualProtect(&iat->u1.Function, 4, old, &old);
+                        ++patched;
+                    }
+                }
+        }
+    }
+    g_renoStatus = patched == 4 ? "RenoDX alignment fix: active" : "RenoDX alignment fix: incomplete";
+    Log("RenoDX alignment shim: %d of 4 heap imports redirected", patched);
+}
+
+struct LdrDllLoadedData {
+    ULONG flags;
+    const void* fullName;  // UNICODE_STRING*
+    const UNICODE_STRING* baseName;
+    PVOID base;
+    ULONG size;
+};
+using LdrRegisterFn = LONG(NTAPI*)(ULONG, void(CALLBACK*)(ULONG, const LdrDllLoadedData*, PVOID), PVOID, PVOID*);
+
+bool IsRenoDxName(const wchar_t* s, size_t n) {
+    std::wstring w(s, n);
+    std::transform(w.begin(), w.end(), w.begin(), ::towlower);
+    static const std::wstring ext = L".addon32";
+    return w.rfind(L"renodx-", 0) == 0 && w.size() > ext.size() &&
+           w.compare(w.size() - ext.size(), ext.size(), ext) == 0;
+}
+
+void CALLBACK OnDllNotification(ULONG reason, const LdrDllLoadedData* data, PVOID) {
+    if (reason != 1 || !data || !data->baseName) return;  // 1 = loaded
+    if (IsRenoDxName(data->baseName->Buffer, data->baseName->Length / 2))
+        PatchRenoDx(static_cast<HMODULE>(data->base));
+}
+
+void InstallRenoDxShim() {
+    // Already loaded (RE6Tweaks loaded late): too late to help this launch, but log it.
+    auto* reg = reinterpret_cast<LdrRegisterFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
+    PVOID cookie = nullptr;
+    if (reg && reg(0, &OnDllNotification, nullptr, &cookie) == 0) Log("RenoDX alignment shim: waiting for RenoDX");
+    else Log("RenoDX alignment shim: LdrRegisterDllNotification failed");
 }
 
 // ---------------------------------------------------------------- device / frame
@@ -533,6 +723,7 @@ void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled(DT_PRODUCT " " DT_VERSION " (probe: changes nothing in the game)");
     ImGui::TextUnformatted(g_deviceInfo.c_str());
     ImGui::TextDisabled("%s", g_modeStatus.c_str());
+    ImGui::TextDisabled("%s", g_renoStatus.c_str());
     ImGui::Separator();
     if (ImGui::Button("Take snapshot (Ctrl+F9)")) Snapshot();
     ImGui::SameLine();
@@ -563,6 +754,7 @@ void Init() {
     Log("---- " DT_PRODUCT " " DT_VERSION " loaded into %ls", path);
     MapImage();
     InstallModeFix();
+    InstallRenoDxShim();
 }
 
 }  // namespace

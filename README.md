@@ -12,6 +12,27 @@ objects so options (field of view, camera distance, shadows, render settings) ca
   does not load into this game.
 - Copy `RE6Tweaks.addon32` next to `BH6.exe`.
 
+## Startup crash fixes
+
+- **Too many display modes.** RE6 copies every D3D9 display mode into a 256-entry table without
+  checking the size. Displays with DSR/DLDSR and high refresh rates report more (377 here), and
+  the game crashes at startup, with or without mods (BH6.exe+0xb429f6). RE6Tweaks hands the game
+  a shorter list (every resolution at its top refresh rate, plus 60/120/144/165 Hz, at most 128
+  modes) and puts d3d9 back as it was once the game creates its device.
+- **RenoDX alignment crash.** RenoDX for RE6 (build 2026-09-21) clears a heap object with
+  16-byte-aligned stores, but 32-bit `HeapAlloc` only guarantees 8 bytes, so it crashes at
+  random (renodx-residentevil6.addon32+0x72a9c). RE6Tweaks makes that add-on's heap blocks
+  16-byte aligned. It only touches that exact RenoDX build.
+
+Both need the add-on to load at process start. Add this to `ReShade.ini`:
+
+```
+[ADDON]
+LoadFromDllMain=RE6Tweaks.addon32
+```
+
+(`LoadFromDllMain` takes add-on file names; `1` is read as a file called "1".)
+
 ## Probe use
 
 - The add-on scans the engine's singletons 20 s after the first frame and writes
