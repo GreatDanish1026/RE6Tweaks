@@ -816,9 +816,11 @@ std::string g_cameraStatus = "camera options: not installed";
 volatile LONG g_viewportCalls = 0, g_viewportChanged = 0;
 
 bool g_loggedChange = false;
+void ApplyShadows();  // shadow options; runs on the game thread from the camera hook
 
 void __stdcall OnCameraCtrl(uintptr_t unit) {
     InterlockedIncrement(&g_viewportCalls);
+    ApplyShadows();
     const float fs = g_fovScale, ds = g_distScale;
     if (fs == 1.0f && ds == 1.0f) return;
     float* fov = reinterpret_cast<float*>(unit + 0x4C);
@@ -878,13 +880,264 @@ void InstallCameraHook() {
     Log("camera hook installed at %08x", (unsigned)kCameraPatch);
 }
 
+// ---------------------------------------------------------------- shadow options
+//
+// Shadows are scene units derived from uShadow: uLightSpaceShadow, uStableShadow (sun),
+// uUniformShadow, uSpotShadow (lamps, flashlight). uShadow fields (from its property list):
+// +0x58 mShadowViewDistance, +0x70 mBackforwardViewDistance, +0x78 mShadowMapType,
+// +0x84 mMapSize (setter 0x1039680 frees and rebuilds the maps), +0xCC mDispersion,
+// +0xEC mPCFType, +0xF0 mVSMBlurType.
+//
+// Live units are tracked through their own vtables, never by scanning memory (a memory scan
+// also finds stale copies of freed units; changing those hung the game). Every vtable entry
+// from slot 5 on is replaced by a small stub that records `this` and jumps to the original,
+// so any call the engine makes marks the unit as live. Slot 0 (the destructor) removes it
+// first. The game thread (camera hook, once per gameplay frame) applies the settings to the
+// live units through the game's setter, after checking their values are sane.
+
+struct ShadowClass {
+    uint32_t vt;
+    const char* name;
+};
+const ShadowClass kShadowClasses[] = {
+    {0x016ea768, "uLightSpaceShadow"}, {0x016ea800, "uStableShadow"},
+    {0x016ea888, "uUniformShadow"},    {0x016ea910, "uSpotShadow"},
+};
+using SetU32Fn = void(__thiscall*)(void*, uint32_t);
+const SetU32Fn kSetMapSize = reinterpret_cast<SetU32Fn>(0x1039680);
+
+const Choice kShadowResChoices[] = {{"Game", 1.0f}, {"2x", 2.0f}, {"4x", 4.0f}};
+const Choice kShadowDistChoices[] = {{"Game", 1.0f}, {"1.5x", 1.5f}, {"2x", 2.0f}};
+int g_shadowResChoice = 0, g_shadowDistChoice = 0;
+volatile float g_shadowResScale = 1.0f, g_shadowDistScale = 1.0f;
+constexpr uint32_t kMaxShadowMap = 8192;
+
+struct ShadowUnit {
+    uint32_t vt = 0;
+    uint32_t origSize = 0, appliedSize = 0;
+    float origDist = 0, appliedDist = 0;
+    bool logged = false;
+    int resets = 0;  // times the game put its own map size back after we set ours
+    bool gaveUp = false;
+};
+SRWLOCK g_liveLock = SRWLOCK_INIT;
+std::set<uintptr_t> g_live;                     // units the engine has called and not destroyed
+std::map<uintptr_t, ShadowUnit> g_shadowUnits;  // game thread only
+std::string g_shadowStatus = "shadows: none seen yet (gameplay only)";
+std::string g_shadowHookStatus = "shadow hooks: not installed";
+
+void __stdcall RecordUnit(uintptr_t obj) {
+    AcquireSRWLockShared(&g_liveLock);
+    const bool known = g_live.count(obj) != 0;
+    ReleaseSRWLockShared(&g_liveLock);
+    if (known) return;
+    AcquireSRWLockExclusive(&g_liveLock);
+    g_live.insert(obj);
+    ReleaseSRWLockExclusive(&g_liveLock);
+}
+
+void __stdcall ForgetUnit(uintptr_t obj) {
+    AcquireSRWLockExclusive(&g_liveLock);
+    g_live.erase(obj);
+    ReleaseSRWLockExclusive(&g_liveLock);
+}
+
+// Stub: pushad; pushfd; push ecx; call fn; popfd; popad; jmp [orig]
+uint8_t* MakeStub(uint8_t*& mem, void* fn, const uint32_t* orig) {
+    uint8_t* s = mem;
+    s[0] = 0x60;
+    s[1] = 0x9C;
+    s[2] = 0x51;
+    s[3] = 0xE8;
+    const int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(fn) - reinterpret_cast<uintptr_t>(s + 8));
+    memcpy(s + 4, &rel, 4);
+    s[8] = 0x9D;
+    s[9] = 0x61;
+    s[10] = 0xFF;
+    s[11] = 0x25;
+    const uint32_t p = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(orig));
+    memcpy(s + 12, &p, 4);
+    mem += 16;
+    return s;
+}
+
+void InstallShadowHooks() {
+    // Original entries are kept here (the stubs jump through them).
+    static uint32_t originals[4][64];
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4 * 64 * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!mem) return;
+    int hooked = 0;
+    for (int c = 0; c < 4; ++c) {
+        auto* vt = reinterpret_cast<uint32_t*>(kShadowClasses[c].vt);
+        int n = 0;
+        // Entries until a non-code value or the start of another shadow class's vtable.
+        auto otherVtable = [&](uintptr_t a) {
+            for (const auto& o : kShadowClasses)
+                if (o.vt != kShadowClasses[c].vt && o.vt == a) return true;
+            return false;
+        };
+        while (n < 64 && g_text.In(vt[n]) && !otherVtable(reinterpret_cast<uintptr_t>(vt + n))) ++n;
+        if (n < 8) {
+            Log("shadow hooks: %s vtable looks wrong (%d entries)", kShadowClasses[c].name, n);
+            continue;
+        }
+        DWORD old;
+        if (!VirtualProtect(vt, n * 4, PAGE_READWRITE, &old)) continue;
+        for (int i = 0; i < n; ++i) {
+            if (i >= 1 && i <= 4) continue;  // createUI/isEnable/createProperty/getDTI: not per-frame
+            originals[c][i] = vt[i];
+            vt[i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                MakeStub(mem, i == 0 ? reinterpret_cast<void*>(&ForgetUnit) : reinterpret_cast<void*>(&RecordUnit),
+                         &originals[c][i])));
+            ++hooked;
+        }
+        VirtualProtect(vt, n * 4, old, &old);
+        Log("shadow hooks: %s, %d vtable entries", kShadowClasses[c].name, n);
+    }
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    g_shadowHookStatus = hooked ? "shadow hooks: active" : "shadow hooks: failed";
+}
+
+const char* ShadowName(uint32_t vt) {
+    for (const auto& c : kShadowClasses)
+        if (c.vt == vt) return c.name;
+    return "?";
+}
+
+struct UnitValues {
+    uint32_t vt, size, pcf, vsm;
+    float dist, backForward, dispersion;
+};
+
+bool ReadUnit(uintptr_t obj, UnitValues& v) {
+    __try {
+        v.vt = *reinterpret_cast<const uint32_t*>(obj);
+        v.size = *reinterpret_cast<const uint32_t*>(obj + 0x84);
+        v.pcf = *reinterpret_cast<const uint32_t*>(obj + 0xEC);
+        v.vsm = *reinterpret_cast<const uint32_t*>(obj + 0xF0);
+        v.dist = *reinterpret_cast<const float*>(obj + 0x58);
+        v.backForward = *reinterpret_cast<const float*>(obj + 0x70);
+        v.dispersion = *reinterpret_cast<const float*>(obj + 0xCC);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool Sane(const UnitValues& v) {
+    bool cls = false;
+    for (const auto& c : kShadowClasses) cls |= c.vt == v.vt;
+    return cls && v.size >= 32 && v.size <= kMaxShadowMap && !(v.size & 31) && std::isfinite(v.dist) &&
+           v.dist > 0.0f && v.dist < 1e6f && v.pcf < 16 && v.vsm < 16;
+}
+
+bool CallSetMapSize(uintptr_t obj, uint32_t size) {
+    __try {
+        kSetMapSize(reinterpret_cast<void*>(obj), size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool WriteFloat(uintptr_t a, float v) {
+    __try {
+        *reinterpret_cast<float*>(a) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void ApplyShadows() {
+    std::vector<uintptr_t> live;
+    AcquireSRWLockShared(&g_liveLock);
+    live.assign(g_live.begin(), g_live.end());
+    ReleaseSRWLockShared(&g_liveLock);
+    // Forget units that are gone.
+    for (auto it = g_shadowUnits.begin(); it != g_shadowUnits.end();)
+        it = std::binary_search(live.begin(), live.end(), it->first) ? std::next(it) : g_shadowUnits.erase(it);
+
+    const float rs = g_shadowResScale, ds = g_shadowDistScale;
+    static LONG sizeSets = 0, distSets = 0, gaveUp = 0;
+    static DWORD lastSummary = GetTickCount();
+    int active = 0;
+    for (uintptr_t obj : live) {
+        UnitValues v;
+        if (!ReadUnit(obj, v) || !Sane(v)) continue;
+        ShadowUnit& u = g_shadowUnits[obj];
+        if (u.vt != v.vt) u = ShadowUnit{v.vt};
+        if (!u.logged) {
+            u.logged = true;
+            Log("shadow unit %08x %s: map %u, view distance %.1f, back/forward %.1f, PCF %u, VSM blur %u, dispersion %.2f",
+                (unsigned)obj, ShadowName(v.vt), v.size, v.dist, v.backForward, v.pcf, v.vsm, v.dispersion);
+        }
+        ++active;
+        // Map size: origSize is the game's value (anything that isn't the value we set). The
+        // setter rebuilds the maps, so a unit whose size the game keeps resetting is left alone
+        // after 3 resets (rebuilding every frame would cost far more than it gains).
+        if (u.appliedSize && v.size != u.appliedSize) ++u.resets;
+        if (!u.appliedSize || v.size != u.appliedSize) u.origSize = v.size;
+        if (rs == 1.0f) {
+            if (u.appliedSize && v.size == u.appliedSize) CallSetMapSize(obj, u.origSize);
+            u.appliedSize = 0;
+            u.resets = 0;
+        } else if (u.resets > 3) {
+            if (!u.gaveUp) {
+                u.gaveUp = true;
+                ++gaveUp;
+                Log("shadow unit %08x: the game keeps resetting its map size (%u); left at the game's value",
+                    (unsigned)obj, v.size);
+            }
+            u.appliedSize = 0;
+        } else {
+            const uint32_t want = std::min(static_cast<uint32_t>(u.origSize * rs), std::max(kMaxShadowMap, u.origSize));
+            if (v.size != want && CallSetMapSize(obj, want)) ++sizeSets;
+            u.appliedSize = want;
+        }
+        // View distance.
+        if (u.appliedDist == 0.0f || v.dist != u.appliedDist) u.origDist = v.dist;
+        if (ds == 1.0f) {
+            if (u.appliedDist != 0.0f && v.dist == u.appliedDist) WriteFloat(obj + 0x58, u.origDist);
+            u.appliedDist = 0.0f;
+        } else {
+            const float want = u.origDist * ds;
+            if (v.dist != want && WriteFloat(obj + 0x58, want)) ++distSets;
+            u.appliedDist = want;
+        }
+    }
+    // Summary every 10 s while something was set (the game recomputes some view distances
+    // every frame, so distance writes repeat; they are cheap).
+    if (GetTickCount() - lastSummary >= 10000) {
+        if (sizeSets || distSets)
+            Log("shadows (10 s): %d units, %ld map-size sets, %ld distance writes, %ld units left to the game "
+                "(resolution x%.0f, distance x%.1f)",
+                active, sizeSets, distSets, gaveUp, rs, ds);
+        sizeSets = distSets = 0;
+        lastSummary = GetTickCount();
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "shadows: %d live shadow units", active);
+    g_shadowStatus = buf;
+}
+
 void ApplyCameraChoices() {
     g_fovScale = kFovChoices[g_fovChoice].value;
     g_distScale = kDistChoices[g_distChoice].value;
+    g_shadowResScale = kShadowResChoices[g_shadowResChoice].value;
+    g_shadowDistScale = kShadowDistChoices[g_shadowDistChoice].value;
 }
 
 void LoadCameraSettings() {
     int v = 0;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowResolution", v) && v >= 0 &&
+        v < (int)std::size(kShadowResChoices))
+        g_shadowResChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "ShadowDistance", v) && v >= 0 &&
+        v < (int)std::size(kShadowDistChoices))
+        g_shadowDistChoice = v;
+    Log("settings: shadow resolution %s, shadow distance %s", kShadowResChoices[g_shadowResChoice].label,
+        kShadowDistChoices[g_shadowDistChoice].label);
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "FieldOfView", v) && v >= 0 && v < (int)std::size(kFovChoices))
         g_fovChoice = v;
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "CameraDistance", v) && v >= 0 && v < (int)std::size(kDistChoices))
@@ -897,6 +1150,8 @@ void LoadCameraSettings() {
 void SaveCameraSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "FieldOfView", g_fovChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "CameraDistance", g_distChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowResolution", g_shadowResChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "ShadowDistance", g_shadowDistChoice);
     ApplyCameraChoices();
 }
 
@@ -1022,6 +1277,14 @@ void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled("%s (frames changed: %ld of %ld)", g_cameraStatus.c_str(), g_viewportChanged,
                         g_viewportCalls);
     ImGui::Separator();
+    combo("Shadow resolution", g_shadowResChoice, kShadowResChoices, (int)std::size(kShadowResChoices),
+          "Sharper shadows: multiplies the size of every shadow map the game uses (up to 8192), for the "
+          "sun, lamps and the flashlight. Applies at once, in gameplay.");
+    combo("Shadow distance", g_shadowDistChoice, kShadowDistChoices, (int)std::size(kShadowDistChoices),
+          "Shadows drawn further from the camera. With cascaded sun shadows this spreads the map over a "
+          "larger area, so pair it with a higher shadow resolution. Applies at once, in gameplay.");
+    ImGui::TextDisabled("%s; %s", g_shadowHookStatus.c_str(), g_shadowStatus.c_str());
+    ImGui::Separator();
     if (!ImGui::CollapsingHeader("Probe tools")) return;
     if (ImGui::Button("Take snapshot (Ctrl+F9)")) Snapshot();
     ImGui::SameLine();
@@ -1058,6 +1321,7 @@ void Init() {
     InstallRenoDxShim();
     InstallCameraHook();
     LoadCameraSettings();
+    InstallShadowHooks();
 }
 
 }  // namespace

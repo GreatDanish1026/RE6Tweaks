@@ -2,8 +2,8 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.1.0**: startup crash fixes, plus field of view and camera distance options for the gameplay
-camera. It also carries the probe tools used to map the engine.
+**0.2.0**: startup crash fixes, field of view and camera distance for the gameplay camera, and
+shadow resolution and distance. It also carries the probe tools used to map the engine.
 
 ## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
 
@@ -12,6 +12,17 @@ camera. It also carries the probe tools used to map the engine.
 - **Camera distance**: Game, 1.15x to 1.75x. Moves the gameplay camera back along its view line,
   so the crosshair stays on target. The game's wall collision uses the normal distance, so far
   settings can clip into walls in tight spaces. Cutscenes are unchanged.
+
+- **Shadow resolution**: Game, 2x, 4x (up to 8192). Multiplies every shadow map the game uses
+  (sun 512/1024, lamps and flashlight 512/1024). Applies at once, in gameplay.
+- **Shadow distance**: Game, 1.5x, 2x. Shadows drawn further out; with sun shadows it spreads
+  the map over a larger area, so pair it with a higher resolution.
+
+Shadows: the game's shadow units (uStableShadow, uSpotShadow, uLightSpaceShadow,
+uUniformShadow) are tracked through their own vtables (each entry records the unit, the
+destructor forgets it), so only live units are touched; the game thread applies the map size
+through the game's own setter (0x1039680, which rebuilds the maps) and the view distance at
++0x58. Units whose map size the game keeps resetting are left alone.
 
 How: each frame the gameplay camera (uCameraCtrl) writes its field of view, position and
 look-at point (code at 0x60DF18). A jump at 0x60DF70 adjusts them right after; they are
