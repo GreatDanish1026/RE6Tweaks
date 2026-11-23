@@ -921,6 +921,22 @@ const ShadowClass kTrackedClasses[] = {
     // into the following data).
     {0x016e8390, "uAmbientOcclusionFilter", 18}, {0x016e8640, "uGodRaysFilter", 18},
     {0x016fa0e0, "uMultiGodRaysFilter", 18},     {0x016e7640, "uMotionBlurFilter", 18},
+    // Census only (logged, not changed): screen effects the game's menu doesn't control.
+    {0x016e74a8, "uTVNoiseFilter", 18},          {0x016e7bf0, "uChromaticAberrationFilter", 18},
+    {0x016e7400, "uDOFFilter", 18},              {0x016e7b28, "uBokehFilter", 18},
+    {0x016e7ec8, "uRadialBlurFilter", 18},       {0x016e7790, "uFishEyeFilter", 18},
+    {0x016e76a8, "uFeedbackBlurFilter", 18},     {0x016e8290, "uBloomFilter", 18},
+    {0x016fa1a0, "uMultiBloomFilter", 24},       {0x016e7748, "uDirectionalGlowFilter", 18},
+    {0x016e7828, "uBlurFilter", 18},             {0x016fa080, "uMultiBlurFilter", 24},
+    {0x016e7870, "uColorCorrectFilter", 18},     {0x016fa140, "uMultiColorCorrectFilter", 24},
+    {0x016e78b8, "uLightScatteringFilter", 18},  {0x016e76f0, "uHazeFilter", 18},
+    {0x016e75e8, "uNoiseFogFilter", 18},         {0x016e77d8, "uColorFogFilter", 18},
+    {0x016e75a0, "uVolumeNoiseFilter", 18},      {0x016e7b88, "uEdgeAntiAliasingFilter", 18},
+    {0x016e74f0, "uImagePlaneFilter", 18},       {0x01528cc0, "uBioImagePlaneFilter", 18},
+    {0x016e7538, "uCrossFadeFilter", 18},        {0x016e7c38, "uCombineFilter", 18},
+    {0x016fa020, "uMultiFilter", 24},            {0x016e7ab8, "uOutlineFilter", 18},
+    {0x01521ff8, "uSdlBloom", 17},               {0x015220d0, "uSdlColorFog", 17},
+    {0x0152ec88, "uCnsShake", 39},
 };
 constexpr int kTrackedCount = static_cast<int>(sizeof(kTrackedClasses) / sizeof(kTrackedClasses[0]));
 using SetU32Fn = void(__thiscall*)(void*, uint32_t);
@@ -1322,6 +1338,66 @@ void ApplyFilters() {
     g_filterStatus = buf;
 }
 
+// ---------------------------------------------------------------- effect census (probe)
+//
+// Every 2 s (present thread, reads only, guarded): which tracked units are alive, by class.
+// Each unit is dumped once (+0x40..+0x13F as hex and float) so its settings can be matched to
+// the class's property list later; the per-class counts are logged when they change. Runs in
+// cutscenes too (the camera hook doesn't).
+
+std::set<uintptr_t> g_censusSeen;
+std::string g_censusSummary = "effect census: nothing yet";
+
+const char* TrackedName(uint32_t vt) {
+    for (const auto& c : kTrackedClasses)
+        if (c.vt == vt) return c.name;
+    return nullptr;
+}
+
+void RunCensus() {
+    std::vector<uintptr_t> live;
+    AcquireSRWLockShared(&g_liveLock);
+    live.assign(g_live.begin(), g_live.end());
+    ReleaseSRWLockShared(&g_liveLock);
+    std::map<std::string, int> counts;
+    for (uintptr_t obj : live) {
+        uint32_t vt = 0;
+        if (!CopyGuarded(obj, &vt, 4)) continue;
+        const char* name = TrackedName(vt);
+        if (!name) continue;
+        ++counts[name];
+        if (!g_censusSeen.insert(obj).second) continue;
+        uint32_t d[0x40];
+        if (!CopyGuarded(obj + 0x40, d, sizeof(d))) continue;
+        std::string line;
+        for (int i = 0; i < 0x40; ++i) {
+            char b[40];
+            float f;
+            memcpy(&f, &d[i], 4);
+            const float a = std::fabs(f);
+            if (d[i] != 0 && std::isfinite(f) && a >= 1e-4f && a <= 1e6f)
+                snprintf(b, sizeof(b), " +%X=%g", 0x40 + i * 4, f);
+            else if (d[i] != 0)
+                snprintf(b, sizeof(b), " +%X=%08x", 0x40 + i * 4, d[i]);
+            else
+                continue;
+            line += b;
+        }
+        Log("census: %s %08x:%s", name, (unsigned)obj, line.c_str());
+    }
+    std::string summary;
+    for (const auto& kv : counts) {
+        char b[64];
+        snprintf(b, sizeof(b), "%s%s x%d", summary.empty() ? "" : ", ", kv.first.c_str(), kv.second);
+        summary += b;
+    }
+    if (summary.empty()) summary = "(none)";
+    if (summary != g_censusSummary) {
+        g_censusSummary = summary;
+        Log("census live: %s", summary.c_str());
+    }
+}
+
 // ---------------------------------------------------------------- draw distance
 //
 // RE6 has no single model-LOD distance (uBaseModel's LOD type is a per-class virtual); its
@@ -1637,6 +1713,13 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
             Log("samplers: %ld sampler states set, %ld surface samplers upgraded", g_samplersSeen, g_samplersChanged);
         }
     }
+    {
+        static DWORD lastCensus = 0;
+        if (GetTickCount() - lastCensus >= 2000) {
+            lastCensus = GetTickCount();
+            RunCensus();
+        }
+    }
     if (KeyPressed(VK_F9, g_f9)) Snapshot();
     if (KeyPressed(VK_F8, g_f8)) StartTrace();
     if (g_tracing && now.QuadPart >= g_traceEnd.QuadPart) StopTrace();
@@ -1727,6 +1810,7 @@ void DrawOverlay(effect_runtime*) {
           "Twice the iterations for light shafts: less banding and stepping. Only where a level has god rays "
           "(counted below). Applies at once, in gameplay.");
     ImGui::TextDisabled("%s", g_filterStatus.c_str());
+    ImGui::TextWrapped("Effect census: %s", g_censusSummary.c_str());
     ImGui::Separator();
     combo("Texture filtering", g_anisoChoice, kAnisoChoices, (int)std::size(kAnisoChoices),
           "16x anisotropic filtering for surface textures: floors and walls stay sharp at an angle. "
