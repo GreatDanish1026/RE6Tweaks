@@ -1271,6 +1271,8 @@ void ApplyField(uint32_t cur, uint32_t& orig, uint32_t& written, bool on, Set se
     written = w;
 }
 
+void ApplyEffectToggles(const std::vector<uintptr_t>& live);  // screen effect toggles, below
+
 void ApplyFilters() {
     std::vector<uintptr_t> live;
     AcquireSRWLockShared(&g_liveLock);
@@ -1278,6 +1280,7 @@ void ApplyFilters() {
     ReleaseSRWLockShared(&g_liveLock);
     for (auto it = g_filterUnits.begin(); it != g_filterUnits.end();)
         it = std::binary_search(live.begin(), live.end(), it->first) ? std::next(it) : g_filterUnits.erase(it);
+    ApplyEffectToggles(live);
     int ao = 0, rays = 0, blur = 0;
     for (uintptr_t obj : live) {
         uint32_t vt = 0;
@@ -1336,6 +1339,64 @@ void ApplyFilters() {
              ao + rays ? "" : " (this area has neither)");
     (void)blur;
     g_filterStatus = buf;
+}
+
+// ---------------------------------------------------------------- screen effect toggles
+//
+// From the census (Leon, gameplay): TV/film noise, bokeh depth of field, bloom, radial blur
+// and colour correction run in gameplay; chromatic aberration and uDOFFilter only on the
+// title/pause menus. A filter is switched off with the unit Draw flag (cUnit +0x10 bit 0x800;
+// the game's own setter 0x473070 just sets/clears that bit), changed atomically so other flag
+// bits the engine changes meanwhile are kept. Game thread (camera hook), gameplay only. With
+// Game, only units this add-on switched off are switched back on.
+
+struct EffectToggle {
+    const char* label;
+    const char* key;  // ReShade.ini key
+    const char* help;
+    uint32_t vts[2];
+    int choice = 0;  // 0 = Game, 1 = Off
+};
+EffectToggle g_effects[] = {
+    {"Film grain", "FilmGrain", "The game's film/TV noise overlay (uTVNoiseFilter).", {0x016e74a8, 0}},
+    {"Depth of field", "DepthOfField", "Background/foreground blur in gameplay and cutscenes (bokeh and DOF filters).",
+     {0x016e7b28, 0x016e7400}},
+    {"Radial blur", "RadialBlur", "Zoom blur from the screen centre (sprints, hits, explosions).", {0x016e7ec8, 0}},
+    {"Bloom", "Bloom", "Glow around bright lights. With RenoDX HDR, Off can look flat.", {0x016e8290, 0x016fa1a0}},
+};
+std::map<uintptr_t, bool> g_effectOff;  // units switched off by us (game thread)
+
+bool OrFlags(uintptr_t a, LONG bits, bool set) {
+    __try {
+        if (set) InterlockedOr(reinterpret_cast<volatile LONG*>(a), bits);
+        else InterlockedAnd(reinterpret_cast<volatile LONG*>(a), ~bits);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void ApplyEffectToggles(const std::vector<uintptr_t>& live) {
+    for (auto it = g_effectOff.begin(); it != g_effectOff.end();)
+        it = std::binary_search(live.begin(), live.end(), it->first) ? std::next(it) : g_effectOff.erase(it);
+    for (uintptr_t obj : live) {
+        uint32_t vt = 0, flags = 0;
+        if (!CopyGuarded(obj, &vt, 4)) continue;
+        const EffectToggle* e = nullptr;
+        for (const EffectToggle& t : g_effects)
+            if (vt && (t.vts[0] == vt || t.vts[1] == vt)) e = &t;
+        if (!e || !CopyGuarded(obj + 0x10, &flags, 4)) continue;
+        const bool drawing = (flags & 0x800) != 0;
+        if (e->choice == 1) {
+            if (drawing && OrFlags(obj + 0x10, 0x800, false)) g_effectOff[obj] = true;
+        } else {
+            auto it = g_effectOff.find(obj);
+            if (it != g_effectOff.end()) {
+                if (!drawing) OrFlags(obj + 0x10, 0x800, true);
+                g_effectOff.erase(it);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- effect census (probe)
@@ -1606,6 +1667,10 @@ void LoadCameraSettings() {
         g_aoChoice = v;
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "GodRays", v) && v >= 0 && v < (int)std::size(kGodRayChoices))
         g_godRayChoice = v;
+    for (EffectToggle& e : g_effects) {
+        if (reshade::get_config_value(nullptr, DT_PRODUCT, e.key, v) && (v == 0 || v == 1)) e.choice = v;
+        if (e.choice) Log("settings: %s off", e.label);
+    }
     Log("settings: ambient occlusion %s, god rays %s", kAoChoices[g_aoChoice].label,
         kGodRayChoices[g_godRayChoice].label);
     if (reshade::get_config_value(nullptr, DT_PRODUCT, "DrawDistance", v) && v >= 0 &&
@@ -1643,6 +1708,7 @@ void SaveCameraSettings() {
     reshade::set_config_value(nullptr, DT_PRODUCT, "DrawDistance", g_drawChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "AmbientOcclusion", g_aoChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "GodRays", g_godRayChoice);
+    for (const EffectToggle& e : g_effects) reshade::set_config_value(nullptr, DT_PRODUCT, e.key, e.choice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureFiltering", g_anisoChoice);
     reshade::set_config_value(nullptr, DT_PRODUCT, "TextureSharpness", g_sharpChoice);
     ApplyCameraChoices();
@@ -1810,6 +1876,13 @@ void DrawOverlay(effect_runtime*) {
           "Twice the iterations for light shafts: less banding and stepping. Only where a level has god rays "
           "(counted below). Applies at once, in gameplay.");
     ImGui::TextDisabled("%s", g_filterStatus.c_str());
+    ImGui::Separator();
+    static const Choice kOnOff[] = {{"Game", 0.0f}, {"Off", 1.0f}};
+    for (EffectToggle& e : g_effects) {
+        char help[256];
+        snprintf(help, sizeof(help), "%s Applies at once, in gameplay.", e.help);
+        combo(e.label, e.choice, kOnOff, 2, help);
+    }
     ImGui::TextWrapped("Effect census: %s", g_censusSummary.c_str());
     ImGui::Separator();
     combo("Texture filtering", g_anisoChoice, kAnisoChoices, (int)std::size(kAnisoChoices),
