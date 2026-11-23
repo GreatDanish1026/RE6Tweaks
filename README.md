@@ -2,9 +2,10 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.5.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
+**0.6.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
 shadow resolution, distance and filtering, draw distance for effects and grass, ambient
-occlusion and god rays quality, and texture filtering and sharpness. It also carries the probe tools used to map the engine.
+occlusion and god rays quality, film grain / depth of field / radial blur / bloom switches,
+and texture filtering and sharpness. It also carries the probe tools used to map the engine.
 
 ## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
 
@@ -30,6 +31,10 @@ occlusion and god rays quality, and texture filtering and sharpness. It also car
   overlay shows how many AO and god rays filters are active.
 - **God rays**: Game, Smoother (2x iterations). uGodRaysFilter / uMultiGodRaysFilter; same
   caveat, untested in game.
+- **Film grain, Depth of field, Radial blur, Bloom**: Game or Off. Screen effects the game's
+  menu doesn't control (an effect census in Leon's chapter found TV noise, bokeh DOF, bloom and
+  radial blur in gameplay; chromatic aberration only on the title/pause menus). Off clears the
+  unit Draw flag (cUnit +0x10 bit 0x800) atomically; Game turns back on only what was turned off.
 - **Texture filtering**: Game, 16x anisotropic. Surface textures (wrapping samplers with linear
   filtering and mips) only; full-screen passes and shadow maps keep the game's filtering.
 - **Texture sharpness**: Game, -0.5, -1 mip bias on the same samplers. -1 can shimmer.
@@ -85,6 +90,7 @@ LoadFromDllMain=RE6Tweaks.addon32
   the camera and render singletons and the camera objects they point to. Take one while
   walking, one while aiming and one in a cutscene so they can be compared.
 - **Ctrl+F8** traces which code writes the camera fields for 2 s (hardware data breakpoints).
+- The overlay's effect census lists the screen-effect filters alive right now (logged too).
 - **Ctrl+F10** measures the frame rate for 10 s.
 - Log: `RE6Tweaks.log` in the game folder.
 

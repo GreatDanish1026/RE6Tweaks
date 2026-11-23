@@ -1388,11 +1388,15 @@ void ApplyEffectToggles(const std::vector<uintptr_t>& live) {
         if (!e || !CopyGuarded(obj + 0x10, &flags, 4)) continue;
         const bool drawing = (flags & 0x800) != 0;
         if (e->choice == 1) {
-            if (drawing && OrFlags(obj + 0x10, 0x800, false)) g_effectOff[obj] = true;
+            if (drawing && OrFlags(obj + 0x10, 0x800, false)) {
+                if (!g_effectOff.count(obj)) Log("effects: %s off (unit %08x)", e->label, (unsigned)obj);
+                g_effectOff[obj] = true;
+            }
         } else {
             auto it = g_effectOff.find(obj);
             if (it != g_effectOff.end()) {
                 if (!drawing) OrFlags(obj + 0x10, 0x800, true);
+                Log("effects: %s back on (unit %08x)", e->label, (unsigned)obj);
                 g_effectOff.erase(it);
             }
         }
