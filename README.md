@@ -13,9 +13,10 @@ camera. It also carries the probe tools used to map the engine.
   so the crosshair stays on target. The game's wall collision uses the normal distance, so far
   settings can clip into walls in tight spaces. Cutscenes are unchanged.
 
-How: each frame sBioCamera copies the active camera unit into its viewport (code at 0x4F9987).
-A jump at 0x4F99F6 adjusts the viewport when the unit is the gameplay camera (uCameraCtrl).
-Checked against the exe timestamp 5a543b8a and the original bytes.
+How: each frame the gameplay camera (uCameraCtrl) writes its field of view, position and
+look-at point (code at 0x60DF18). A jump at 0x60DF70 adjusts them right after; they are
+recomputed every frame, so nothing builds up. Checked against the exe timestamp 5a543b8a and the
+original bytes.
 
 ## Requirements
 
