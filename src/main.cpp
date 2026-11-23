@@ -786,23 +786,23 @@ void StopTrace() {
 
 // ---------------------------------------------------------------- camera options
 //
-// Each frame sBioCamera copies the active camera unit (gameplay: uCameraCtrl; cutscenes:
-// uEventMotionCamera, ...) into its viewport: position +0xE30, look-at +0xE40, up +0xE50,
-// vertical field of view in degrees +0xE60, near +0xE64, far +0xE68 (code at 0x4F9987). The
-// renderer builds the view from that viewport. A jump at 0x4F99F6 (right after the field of
-// view is copied) calls OnViewport, which changes the viewport only when the unit is the
-// gameplay camera, so cutscenes keep their framing:
+// The gameplay camera unit (uCameraCtrl) fills its standard camera fields once per frame at
+// 0x60DF18..0x60DF76 from its own results: far +0x40, near +0x44, aspect +0x48, vertical
+// field of view in degrees +0x4C (from +0x62C), position +0x50 (from +0x630), up +0x60,
+// look-at +0x70 (from +0x650). The view is built from those fields; the results it copies
+// from are recomputed every frame, so changing the fields does not feed back.
+// (sBioCamera's copy at 0x4F9950 is only a saved-camera slot; changing it shows nothing.)
+// A jump at 0x60DF70, right after the field of view is written, calls OnCameraCtrl:
 //   - field of view: tan(fov/2) is multiplied, so the aiming zoom keeps its ratio;
 //   - distance: the position moves along the look-at line, so the crosshair stays on target.
 //     The game's wall collision was computed for the original distance, so far settings can
 //     clip into walls in tight spaces.
+// The replaced instructions (fld [esi+6A4h]; fstp [esi+0C4h]) run first, and the flags from
+// the test at 0x60DF60 are kept for the je at 0x60DF7C. Cutscenes use other camera units.
 
 constexpr DWORD kExeStamp = 0x5a543b8a;
-constexpr uintptr_t kViewportPatch = 0x4F99F6;  // fld [esi+4Ch] ; fstp [eax+0E60h]
-constexpr uintptr_t kViewportReturn = 0x4F99FF;
-constexpr uint32_t kCameraCtrlVt = 0x0152d620;   // uCameraCtrl vtable
-constexpr uint32_t kCameraCtrlGetDti = 0x60aa60;  // uCameraCtrl::getDTI (vtable slot 4)
-const uint8_t kViewportBytes[9] = {0xD9, 0x46, 0x4C, 0xD9, 0x98, 0x60, 0x0E, 0x00, 0x00};
+constexpr uintptr_t kCameraPatch = 0x60DF70;
+const uint8_t kCameraBytes[12] = {0xD9, 0x86, 0xA4, 0x06, 0x00, 0x00, 0xD9, 0x9E, 0xC4, 0x00, 0x00, 0x00};
 
 struct Choice {
     const char* label;
@@ -815,44 +815,40 @@ volatile float g_fovScale = 1.0f, g_distScale = 1.0f;
 std::string g_cameraStatus = "camera options: not installed";
 volatile LONG g_viewportCalls = 0, g_viewportChanged = 0;
 
-bool IsGameplayCamera(uintptr_t unit) {
-    __try {
-        const uint32_t vt = *reinterpret_cast<const uint32_t*>(unit);
-        return vt == kCameraCtrlVt || reinterpret_cast<const uint32_t*>(vt)[4] == kCameraCtrlGetDti;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
+bool g_loggedChange = false;
 
-void __stdcall OnViewport(uintptr_t unit, uintptr_t vp) {
+void __stdcall OnCameraCtrl(uintptr_t unit) {
     InterlockedIncrement(&g_viewportCalls);
     const float fs = g_fovScale, ds = g_distScale;
-    if ((fs == 1.0f && ds == 1.0f) || !IsGameplayCamera(unit)) return;
-    float* pos = reinterpret_cast<float*>(vp + 0xE30);
-    const float* at = reinterpret_cast<const float*>(vp + 0xE40);
-    float* fov = reinterpret_cast<float*>(vp + 0xE60);
-    if (fs != 1.0f && *fov > 1.0f && *fov < 170.0f) {
-        const float half = *fov * (3.14159265f / 360.0f);
-        float f = std::atan(std::tan(half) * fs) * (360.0f / 3.14159265f);
-        *fov = std::min(f, 150.0f);
+    if (fs == 1.0f && ds == 1.0f) return;
+    float* fov = reinterpret_cast<float*>(unit + 0x4C);
+    float* pos = reinterpret_cast<float*>(unit + 0x50);
+    const float* at = reinterpret_cast<const float*>(unit + 0x70);
+    const float fov0 = *fov;
+    if (fs != 1.0f && fov0 > 1.0f && fov0 < 170.0f) {
+        const float half = fov0 * (3.14159265f / 360.0f);
+        *fov = std::min(std::atan(std::tan(half) * fs) * (360.0f / 3.14159265f), 150.0f);
     }
     if (ds != 1.0f)
         for (int i = 0; i < 3; ++i) pos[i] = at[i] + (pos[i] - at[i]) * ds;
     InterlockedIncrement(&g_viewportChanged);
+    if (!g_loggedChange) {
+        g_loggedChange = true;
+        Log("camera: first change, unit %08x, fov %.2f -> %.2f, distance x%.2f", (unsigned)unit, fov0, *fov, ds);
+    }
 }
 
-__declspec(naked) void ViewportStub() {
+__declspec(naked) void CameraStub() {
     __asm {
-        fld dword ptr [esi + 4Ch]
-        fstp dword ptr [eax + 0E60h]
+        fld dword ptr [esi + 6A4h]
+        fstp dword ptr [esi + 0C4h]
         pushad
         pushfd
-        push eax
         push esi
-        call OnViewport
+        call OnCameraCtrl
         popfd
         popad
-        push 004F99FFh  // kViewportReturn
+        push 0060DF7Ch  // back to the je after the replaced instructions
         ret
     }
 }
@@ -864,22 +860,22 @@ void InstallCameraHook() {
         Log("camera hook: exe timestamp %08x not supported", (unsigned)nt->FileHeader.TimeDateStamp);
         return;
     }
-    auto* site = reinterpret_cast<uint8_t*>(kViewportPatch);
-    if (memcmp(site, kViewportBytes, sizeof(kViewportBytes))) {
+    auto* site = reinterpret_cast<uint8_t*>(kCameraPatch);
+    if (memcmp(site, kCameraBytes, sizeof(kCameraBytes))) {
         g_cameraStatus = "camera options: code not as expected (another mod?)";
-        Log("camera hook: unexpected bytes at %08x", (unsigned)kViewportPatch);
+        Log("camera hook: unexpected bytes at %08x", (unsigned)kCameraPatch);
         return;
     }
     DWORD old;
-    if (!VirtualProtect(site, 9, PAGE_EXECUTE_READWRITE, &old)) return;
-    uint8_t patch[9] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
-    const int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&ViewportStub) - (kViewportPatch + 5));
+    if (!VirtualProtect(site, sizeof(kCameraBytes), PAGE_EXECUTE_READWRITE, &old)) return;
+    uint8_t patch[12] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&CameraStub) - (kCameraPatch + 5));
     memcpy(patch + 1, &rel, 4);
     memcpy(site, patch, sizeof(patch));
-    VirtualProtect(site, 9, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 9);
+    VirtualProtect(site, sizeof(kCameraBytes), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(kCameraBytes));
     g_cameraStatus = "camera options: active";
-    Log("camera hook installed at %08x", (unsigned)kViewportPatch);
+    Log("camera hook installed at %08x", (unsigned)kCameraPatch);
 }
 
 void ApplyCameraChoices() {
