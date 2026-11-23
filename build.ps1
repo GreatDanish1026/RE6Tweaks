@@ -5,6 +5,7 @@
 #   -Install  copies the add-on next to the game's exe (game closed).
 param(
     [switch]$Install,
+    [switch]$Package,
     [string]$GameDir = "E:\SteamLibrary\steamapps\common\Resident Evil 6"
 )
 $ErrorActionPreference = 'Stop'
@@ -40,4 +41,20 @@ if ($Install) {
     if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
     Copy-Item $addon $GameDir -Force
     Write-Host "Installed to $GameDir"
+}
+
+if ($Package) {
+    $version = [regex]::Match((Get-Content "$root\src\version.h" -Raw), 'DT_VERSION "([^"]+)"').Groups[1].Value
+    $zip = "$root\bin\release\RE6Tweaks-$version.zip"
+    New-Item -ItemType Directory -Force (Split-Path $zip) | Out-Null
+    if (Test-Path $zip) { Remove-Item -Force $zip }
+    # ZipFile with forward-slash entry names (Compress-Archive writes backslashes, which break on Linux).
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $z = [IO.Compression.ZipFile]::Open($zip, 'Create')
+    try {
+        foreach ($f in @($addon, "$root\README.md", "$root\LICENSE", "$root\THIRD_PARTY_NOTICES.txt")) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $f, (Split-Path $f -Leaf).Replace('\', '/'))
+        }
+    } finally { $z.Dispose() }
+    Write-Host "Packaged $zip"
 }

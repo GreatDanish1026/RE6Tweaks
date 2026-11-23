@@ -2,12 +2,34 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.6.0**: startup crash fixes, field of view and camera distance for the gameplay camera,
-shadow resolution, distance and filtering, draw distance for effects and grass, ambient
-occlusion and god rays quality, film grain / depth of field / radial blur / bloom switches,
-and texture filtering and sharpness. It also carries the probe tools used to map the engine.
+- Fixes two startup crashes: too many display modes (DSR/DLDSR, high refresh rates) and a
+  random crash in RenoDX's RE6 add-on.
+- Field of view and camera distance for the gameplay camera.
+- Shadow resolution, distance and filtering; draw distance for effects and grass.
+- Film grain, depth of field, radial blur and bloom switches.
+- 16x anisotropic texture filtering and texture sharpness.
 
-## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
+Tested with the Steam version (BH6.exe 1.1.0.0) on Leon's campaign, with RenoDX for HDR.
+
+## Install
+
+1. RE6 is a **32-bit** game. Install the **32-bit** ReShade 6.8.0 **with add-on support** as
+   `d3d9.dll` next to `BH6.exe` (a 64-bit ReShade, or any `*.addon64`, does not load).
+2. Copy `RE6Tweaks.addon32` next to `BH6.exe`.
+3. Open `ReShade.ini` next to `BH6.exe` and add this line under `[ADDON]` (it loads the add-on
+   when the game starts, which the crash fixes need):
+
+   ```
+   LoadFromDllMain=RE6Tweaks.addon32
+   ```
+
+4. Start the game, open the ReShade overlay (Home) and pick the **RE6Tweaks** tab. Settings are
+   saved in `ReShade.ini` under `[RE6Tweaks]` and apply at once (most of them in gameplay).
+
+Uninstall: delete `RE6Tweaks.addon32` and the `LoadFromDllMain` line. The add-on changes nothing
+on disk except its own log (`RE6Tweaks.log`) and probe folder (`RE6Tweaks-probe`).
+
+## Options
 
 - **Field of view**: Game, +10% to +50%. Widens the gameplay camera, walking and aiming (aiming
   keeps its relative zoom). Cutscenes are unchanged. Applies at once.
@@ -54,13 +76,6 @@ look-at point (code at 0x60DF18). A jump at 0x60DF70 adjusts them right after; t
 recomputed every frame, so nothing builds up. Checked against the exe timestamp 5a543b8a and the
 original bytes.
 
-## Requirements
-
-- Resident Evil 6 is a **32-bit D3D9** game. It needs the **32-bit** ReShade 6.8.0 with add-on
-  support, installed as `d3d9.dll` next to `BH6.exe`. A 64-bit ReShade (or any `*.addon64`)
-  does not load into this game.
-- Copy `RE6Tweaks.addon32` next to `BH6.exe`.
-
 ## Startup crash fixes
 
 - **Too many display modes.** RE6 copies every D3D9 display mode into a 256-entry table without
@@ -73,16 +88,10 @@ original bytes.
   random (renodx-residentevil6.addon32+0x72a9c). RE6Tweaks makes that add-on's heap blocks
   16-byte aligned. It only touches that exact RenoDX build.
 
-Both need the add-on to load at process start. Add this to `ReShade.ini`:
+Both need the add-on to load at process start: the `LoadFromDllMain=RE6Tweaks.addon32` line from
+Install (`LoadFromDllMain` takes add-on file names; `1` is read as a file called "1").
 
-```
-[ADDON]
-LoadFromDllMain=RE6Tweaks.addon32
-```
-
-(`LoadFromDllMain` takes add-on file names; `1` is read as a file called "1".)
-
-## Probe use
+## Probe tools (for development)
 
 - The add-on scans the engine's singletons 20 s after the first frame and writes
   `RE6Tweaks-probe\statics.txt` in the game folder.
@@ -108,4 +117,5 @@ pointers sit 4 bytes before their type record for `sMain` (0x186e1b4), `sScene` 
 
 ## Build
 
-`.\build.ps1 [-Install]` (Visual Studio 2022+ with C++ x86 tools).
+`.\build.ps1 [-Install] [-Package]` (Visual Studio 2022+ with C++ x86 tools). `-Package` makes
+`bin\release\RE6Tweaks-<version>.zip` (add-on, README, LICENSE, THIRD_PARTY_NOTICES).
