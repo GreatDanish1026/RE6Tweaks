@@ -2,8 +2,20 @@
 
 Graphics and camera tweaks for **Resident Evil 6** (Steam, `BH6.exe`), as a ReShade add-on.
 
-**0.0.1 is a probe.** It changes nothing in the game. It maps the engine's camera and render
-objects so options (field of view, camera distance, shadows, render settings) can be built next.
+**0.1.0**: startup crash fixes, plus field of view and camera distance options for the gameplay
+camera. It also carries the probe tools used to map the engine.
+
+## Options (ReShade overlay, RE6Tweaks tab; saved in ReShade.ini [RE6Tweaks])
+
+- **Field of view**: Game, +10% to +50%. Widens the gameplay camera, walking and aiming (aiming
+  keeps its relative zoom). Cutscenes are unchanged. Applies at once.
+- **Camera distance**: Game, 1.15x to 1.75x. Moves the gameplay camera back along its view line,
+  so the crosshair stays on target. The game's wall collision uses the normal distance, so far
+  settings can clip into walls in tight spaces. Cutscenes are unchanged.
+
+How: each frame sBioCamera copies the active camera unit into its viewport (code at 0x4F9987).
+A jump at 0x4F99F6 adjusts the viewport when the unit is the gameplay camera (uCameraCtrl).
+Checked against the exe timestamp 5a543b8a and the original bytes.
 
 ## Requirements
 
@@ -40,6 +52,7 @@ LoadFromDllMain=RE6Tweaks.addon32
 - **Ctrl+F9** (or the overlay button) writes `RE6Tweaks-probe\snapshot-NN.txt`: every field of
   the camera and render singletons and the camera objects they point to. Take one while
   walking, one while aiming and one in a cutscene so they can be compared.
+- **Ctrl+F8** traces which code writes the camera fields for 2 s (hardware data breakpoints).
 - **Ctrl+F10** measures the frame rate for 10 s.
 - Log: `RE6Tweaks.log` in the game folder.
 

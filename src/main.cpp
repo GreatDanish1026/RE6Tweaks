@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
+#include <tlhelp32.h>
 #include <d3d9.h>
 #include <cwctype>
 
@@ -635,13 +636,281 @@ void InstallRenoDxShim() {
     else Log("RenoDX alignment shim: LdrRegisterDllNotification failed");
 }
 
+// ---------------------------------------------------------------- write trace (probe)
+//
+// Ctrl+F8: hardware data breakpoints (DR0..DR3) on camera fields, in every thread, for 2 s.
+// A vectored handler counts the code address after each write (data breakpoints trap after
+// the instruction), so the code that sets the field of view and camera position can be found.
+// Threads are changed one at a time from a helper thread, with no allocation while a thread
+// is suspended.
+
+constexpr int kMaxHits = 64;
+struct Hit {
+    volatile LONG addr;
+    volatile LONG count;
+};
+Hit g_hits[4][kMaxHits];
+uintptr_t g_watch[4] = {};
+const char* g_watchName[4] = {};
+bool g_tracing = false;
+LARGE_INTEGER g_traceEnd{};
+PVOID g_veh = nullptr;
+
+LONG CALLBACK TraceHandler(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    const DWORD hit = c->Dr6 & 0xf;
+    if (!hit) return EXCEPTION_CONTINUE_SEARCH;
+    for (int i = 0; i < 4; ++i) {
+        if (!(hit & (1u << i))) continue;
+        const LONG eip = static_cast<LONG>(c->Eip);
+        for (int k = 0; k < kMaxHits; ++k) {
+            const LONG cur = InterlockedCompareExchange(&g_hits[i][k].addr, eip, 0);
+            if (cur == 0 || cur == eip) {
+                InterlockedIncrement(&g_hits[i][k].count);
+                break;
+            }
+        }
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+struct DrJob {
+    DWORD caller;
+    bool enable;
+};
+
+DWORD WINAPI SetDebugRegisters(LPVOID p) {
+    const DrJob* job = static_cast<DrJob*>(p);
+    DWORD ids[1024];
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te{sizeof(te)};
+        for (BOOL ok = Thread32First(snap, &te); ok && n < 1024; ok = Thread32Next(snap, &te))
+            if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != GetCurrentThreadId())
+                ids[n++] = te.th32ThreadID;
+        CloseHandle(snap);
+    }
+    DWORD dr7 = 0;
+    if (job->enable)
+        for (int i = 0; i < 4; ++i)
+            if (g_watch[i]) dr7 |= (1u << (2 * i)) | (1u << (16 + 4 * i)) | (3u << (18 + 4 * i));  // local, write, 4 bytes
+    for (int i = 0; i < n; ++i) {
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ids[i]);
+        if (!t) continue;
+        if (SuspendThread(t) != (DWORD)-1) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c)) {
+                c.Dr0 = job->enable ? g_watch[0] : 0;
+                c.Dr1 = job->enable ? g_watch[1] : 0;
+                c.Dr2 = job->enable ? g_watch[2] : 0;
+                c.Dr3 = job->enable ? g_watch[3] : 0;
+                c.Dr6 = 0;
+                c.Dr7 = dr7;
+                SetThreadContext(t, &c);
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    return n;
+}
+
+int RunDrJob(bool enable) {
+    DrJob job{GetCurrentThreadId(), enable};
+    HANDLE h = CreateThread(nullptr, 0, &SetDebugRegisters, &job, 0, nullptr);
+    if (!h) return 0;
+    WaitForSingleObject(h, 5000);
+    DWORD n = 0;
+    GetExitCodeThread(h, &n);
+    CloseHandle(h);
+    return static_cast<int>(n);
+}
+
+uintptr_t FindPointee(uintptr_t obj, size_t size, const char* cls) {
+    size = std::min(size, ReadableFrom(obj));
+    for (size_t o = 0; o + 4 <= size; o += 4) {
+        uint32_t v = 0;
+        if (!Read32(obj + o, v) || v < 0x10000 || g_image.In(v)) continue;
+        const char* c = ClassOf(v);
+        if (c && !strcmp(c, cls)) return v;
+    }
+    return 0;
+}
+
+uintptr_t g_bioCamera = 0, g_cameraCtrl = 0;
+
+bool FindCamera() {
+    MapReadable();
+    uint32_t cam = 0;
+    g_bioCamera = Read32(0x186e23c, cam) && cam && ClassOf(cam) && !strcmp(ClassOf(cam), "sBioCamera") ? cam : 0;
+    if (!g_bioCamera) {
+        Scan();
+        for (const Found& x : g_found)
+            if (x.cls == "sBioCamera") g_bioCamera = x.obj;
+    }
+    g_cameraCtrl = g_bioCamera ? FindPointee(g_bioCamera, 0x4000, "uCameraCtrl") : 0;
+    Log("camera: sBioCamera %08x, uCameraCtrl %08x", (unsigned)g_bioCamera, (unsigned)g_cameraCtrl);
+    return g_bioCamera && g_cameraCtrl;
+}
+
+void StartTrace() {
+    if (g_tracing || !FindCamera()) return;
+    memset(g_hits, 0, sizeof(g_hits));
+    g_watch[0] = g_cameraCtrl + 0x4c, g_watchName[0] = "uCameraCtrl+0x4c fov";
+    g_watch[1] = g_bioCamera + 0xe60, g_watchName[1] = "sBioCamera+0xe60 fov";
+    g_watch[2] = g_cameraCtrl + 0x50, g_watchName[2] = "uCameraCtrl+0x50 pos.x";
+    g_watch[3] = g_cameraCtrl + 0x70, g_watchName[3] = "uCameraCtrl+0x70 target.x";
+    if (!g_veh) g_veh = AddVectoredExceptionHandler(1, &TraceHandler);
+    const int n = RunDrJob(true);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&g_traceEnd);
+    g_traceEnd.QuadPart += 2 * freq.QuadPart;
+    g_tracing = true;
+    Log("trace: watching %d threads for 2 s", n);
+}
+
+void StopTrace() {
+    RunDrJob(false);
+    g_tracing = false;
+    for (int i = 0; i < 4; ++i) {
+        Log("trace %s (%08x):", g_watchName[i], (unsigned)g_watch[i]);
+        for (int k = 0; k < kMaxHits && g_hits[i][k].addr; ++k)
+            Log("   writer: code before %08x  x%ld", (unsigned)g_hits[i][k].addr, g_hits[i][k].count);
+    }
+}
+
+// ---------------------------------------------------------------- camera options
+//
+// Each frame sBioCamera copies the active camera unit (gameplay: uCameraCtrl; cutscenes:
+// uEventMotionCamera, ...) into its viewport: position +0xE30, look-at +0xE40, up +0xE50,
+// vertical field of view in degrees +0xE60, near +0xE64, far +0xE68 (code at 0x4F9987). The
+// renderer builds the view from that viewport. A jump at 0x4F99F6 (right after the field of
+// view is copied) calls OnViewport, which changes the viewport only when the unit is the
+// gameplay camera, so cutscenes keep their framing:
+//   - field of view: tan(fov/2) is multiplied, so the aiming zoom keeps its ratio;
+//   - distance: the position moves along the look-at line, so the crosshair stays on target.
+//     The game's wall collision was computed for the original distance, so far settings can
+//     clip into walls in tight spaces.
+
+constexpr DWORD kExeStamp = 0x5a543b8a;
+constexpr uintptr_t kViewportPatch = 0x4F99F6;  // fld [esi+4Ch] ; fstp [eax+0E60h]
+constexpr uintptr_t kViewportReturn = 0x4F99FF;
+constexpr uint32_t kCameraCtrlVt = 0x0152d620;   // uCameraCtrl vtable
+constexpr uint32_t kCameraCtrlGetDti = 0x60aa60;  // uCameraCtrl::getDTI (vtable slot 4)
+const uint8_t kViewportBytes[9] = {0xD9, 0x46, 0x4C, 0xD9, 0x98, 0x60, 0x0E, 0x00, 0x00};
+
+struct Choice {
+    const char* label;
+    float value;
+};
+const Choice kFovChoices[] = {{"Game", 1.0f}, {"+10%", 1.1f}, {"+20%", 1.2f}, {"+30%", 1.3f}, {"+40%", 1.4f}, {"+50%", 1.5f}};
+const Choice kDistChoices[] = {{"Game", 1.0f}, {"1.15x", 1.15f}, {"1.3x", 1.3f}, {"1.5x", 1.5f}, {"1.75x", 1.75f}};
+int g_fovChoice = 0, g_distChoice = 0;
+volatile float g_fovScale = 1.0f, g_distScale = 1.0f;
+std::string g_cameraStatus = "camera options: not installed";
+volatile LONG g_viewportCalls = 0, g_viewportChanged = 0;
+
+bool IsGameplayCamera(uintptr_t unit) {
+    __try {
+        const uint32_t vt = *reinterpret_cast<const uint32_t*>(unit);
+        return vt == kCameraCtrlVt || reinterpret_cast<const uint32_t*>(vt)[4] == kCameraCtrlGetDti;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void __stdcall OnViewport(uintptr_t unit, uintptr_t vp) {
+    InterlockedIncrement(&g_viewportCalls);
+    const float fs = g_fovScale, ds = g_distScale;
+    if ((fs == 1.0f && ds == 1.0f) || !IsGameplayCamera(unit)) return;
+    float* pos = reinterpret_cast<float*>(vp + 0xE30);
+    const float* at = reinterpret_cast<const float*>(vp + 0xE40);
+    float* fov = reinterpret_cast<float*>(vp + 0xE60);
+    if (fs != 1.0f && *fov > 1.0f && *fov < 170.0f) {
+        const float half = *fov * (3.14159265f / 360.0f);
+        float f = std::atan(std::tan(half) * fs) * (360.0f / 3.14159265f);
+        *fov = std::min(f, 150.0f);
+    }
+    if (ds != 1.0f)
+        for (int i = 0; i < 3; ++i) pos[i] = at[i] + (pos[i] - at[i]) * ds;
+    InterlockedIncrement(&g_viewportChanged);
+}
+
+__declspec(naked) void ViewportStub() {
+    __asm {
+        fld dword ptr [esi + 4Ch]
+        fstp dword ptr [eax + 0E60h]
+        pushad
+        pushfd
+        push eax
+        push esi
+        call OnViewport
+        popfd
+        popad
+        push 004F99FFh  // kViewportReturn
+        ret
+    }
+}
+
+void InstallCameraHook() {
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(g_base + reinterpret_cast<IMAGE_DOS_HEADER*>(g_base)->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != kExeStamp || g_base != 0x400000) {
+        g_cameraStatus = "camera options: unsupported game version";
+        Log("camera hook: exe timestamp %08x not supported", (unsigned)nt->FileHeader.TimeDateStamp);
+        return;
+    }
+    auto* site = reinterpret_cast<uint8_t*>(kViewportPatch);
+    if (memcmp(site, kViewportBytes, sizeof(kViewportBytes))) {
+        g_cameraStatus = "camera options: code not as expected (another mod?)";
+        Log("camera hook: unexpected bytes at %08x", (unsigned)kViewportPatch);
+        return;
+    }
+    DWORD old;
+    if (!VirtualProtect(site, 9, PAGE_EXECUTE_READWRITE, &old)) return;
+    uint8_t patch[9] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+    const int32_t rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&ViewportStub) - (kViewportPatch + 5));
+    memcpy(patch + 1, &rel, 4);
+    memcpy(site, patch, sizeof(patch));
+    VirtualProtect(site, 9, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 9);
+    g_cameraStatus = "camera options: active";
+    Log("camera hook installed at %08x", (unsigned)kViewportPatch);
+}
+
+void ApplyCameraChoices() {
+    g_fovScale = kFovChoices[g_fovChoice].value;
+    g_distScale = kDistChoices[g_distChoice].value;
+}
+
+void LoadCameraSettings() {
+    int v = 0;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "FieldOfView", v) && v >= 0 && v < (int)std::size(kFovChoices))
+        g_fovChoice = v;
+    if (reshade::get_config_value(nullptr, DT_PRODUCT, "CameraDistance", v) && v >= 0 && v < (int)std::size(kDistChoices))
+        g_distChoice = v;
+    ApplyCameraChoices();
+    Log("settings: field of view %s, camera distance %s", kFovChoices[g_fovChoice].label,
+        kDistChoices[g_distChoice].label);
+}
+
+void SaveCameraSettings() {
+    reshade::set_config_value(nullptr, DT_PRODUCT, "FieldOfView", g_fovChoice);
+    reshade::set_config_value(nullptr, DT_PRODUCT, "CameraDistance", g_distChoice);
+    ApplyCameraChoices();
+}
+
 // ---------------------------------------------------------------- device / frame
 
 LARGE_INTEGER g_freq{}, g_last{}, g_measureEnd{}, g_firstPresent{};
 bool g_measuring = false, g_autoScanned = false;
 std::vector<double> g_frameMs;
 std::string g_measureResult, g_deviceInfo;
-bool g_f9 = false, g_f10 = false;
+bool g_f8 = false, g_f9 = false, g_f10 = false;
 
 void OnInitDevice(device* dev) {
     static const char* const apis[] = {"?", "d3d9", "d3d10", "d3d11", "d3d12", "opengl", "vulkan"};
@@ -692,6 +961,8 @@ void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, c
         Scan();
     }
     if (KeyPressed(VK_F9, g_f9)) Snapshot();
+    if (KeyPressed(VK_F8, g_f8)) StartTrace();
+    if (g_tracing && now.QuadPart >= g_traceEnd.QuadPart) StopTrace();
     if (KeyPressed(VK_F10, g_f10) && !g_measuring) StartMeasure(10.0);
     if (g_measuring && g_last.QuadPart) {
         g_frameMs.push_back((now.QuadPart - g_last.QuadPart) * 1000.0 / g_freq.QuadPart);
@@ -725,9 +996,43 @@ void DrawOverlay(effect_runtime*) {
     ImGui::TextDisabled("%s", g_modeStatus.c_str());
     ImGui::TextDisabled("%s", g_renoStatus.c_str());
     ImGui::Separator();
+
+    auto combo = [](const char* label, int& cur, const Choice* choices, int n, const char* help) {
+        if (ImGui::BeginCombo(label, choices[cur].label)) {
+            for (int i = 0; i < n; ++i)
+                if (ImGui::Selectable(choices[i].label, i == cur) && i != cur) {
+                    cur = i;
+                    SaveCameraSettings();
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextUnformatted(help);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    };
+    combo("Field of view", g_fovChoice, kFovChoices, (int)std::size(kFovChoices),
+          "Wider view in gameplay (walking and aiming; aiming keeps its zoom). Cutscenes are unchanged. "
+          "Applies at once.");
+    combo("Camera distance", g_distChoice, kDistChoices, (int)std::size(kDistChoices),
+          "Moves the gameplay camera further back along its view line, so the crosshair stays on target. "
+          "The game's wall collision uses the normal distance, so far settings can clip into walls in "
+          "tight spaces. Cutscenes are unchanged. Applies at once.");
+    ImGui::TextDisabled("%s (frames changed: %ld of %ld)", g_cameraStatus.c_str(), g_viewportChanged,
+                        g_viewportCalls);
+    ImGui::Separator();
+    if (!ImGui::CollapsingHeader("Probe tools")) return;
     if (ImGui::Button("Take snapshot (Ctrl+F9)")) Snapshot();
     ImGui::SameLine();
     ImGui::Text("%d taken", g_snapshot);
+    ImGui::BeginDisabled(g_tracing);
+    if (ImGui::Button("Trace camera writers, 2 s (Ctrl+F8)")) StartTrace();
+    ImGui::EndDisabled();
     ImGui::TextDisabled("Scan: %s", g_scanStatus.c_str());
     ImGui::TextWrapped("Snapshots go to " DT_PRODUCT "-probe\\ in the game folder. Take one while walking, "
                        "one while aiming, one in the pause menu.");
@@ -755,6 +1060,8 @@ void Init() {
     MapImage();
     InstallModeFix();
     InstallRenoDxShim();
+    InstallCameraHook();
+    LoadCameraSettings();
 }
 
 }  // namespace
